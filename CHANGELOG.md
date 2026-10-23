@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.0
+
+- `/land-it:respond` and `land-it threads [PR | reply ID --body B --resolve]`: every unresolved review thread on a PR
+  (Code Review, the CI workflow, Copilot, people) goes into the findings ledger with its thread id, gets fixed or a
+  reasoned won't-fix, and is answered and resolved through GitHub GraphQL after the user confirms. Replies always
+  trigger a permission prompt, since they post under the user's account; a person's won't-fix thread is left for them to close.
+- `/land-it:sweep`, `land-it sweep-target` and `templates/workflows/land-it-sweep.yml` (`init --sweep`): the article's
+  nightly review agents. One `risk.high` area per night by rotation (or the top-level source directories), new
+  bugs filed as one `land-it-sweep` issue, ones already filed skipped.
+- `land-it eval scan`: reverts on the base branch whose reverted commit isn't an eval case yet.
+- preflight offers a follow-up issue for pre-existing findings instead of letting them vanish with the PR.
+
 ## 0.5.0
 
 - `/land-it:stats` and `land-it stats [--days N] [--github]`: the article's numbers for the repo. One-round passes,

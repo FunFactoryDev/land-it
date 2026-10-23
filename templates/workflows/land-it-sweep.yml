@@ -1,0 +1,32 @@
+# land-it sweep: every night, review one high-risk area of existing code and file new bugs as an issue.
+# Rotates over the repo's risk.high areas in .claude/land-it.json (or its top-level source directories).
+# Secrets: CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`) or ANTHROPIC_API_KEY.
+# Install the Claude GitHub App first: https://github.com/apps/claude (or run /install-github-app).
+name: land-it sweep
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          plugin_marketplaces: "https://github.com/FunFactoryDev/land-it.git"
+          plugins: "land-it@land-it-marketplace"
+          prompt: "/land-it:sweep --ci"
+          claude_args: '--allowedTools "Read,Grep,Glob,Skill,Agent,Bash(land-it *),Bash(git log *),Bash(git blame *),Bash(gh issue list *),Bash(gh issue create *),Bash(gh label create *)"'

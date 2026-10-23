@@ -61,6 +61,8 @@ flowchart TD
     F --> G{"gh pr merge"}
     G -- "low tier, stamped" --> H["merges on green checks"]
     G -- "medium / high" --> I["a person decides"]
+    F --> R["/land-it:respond: every review thread answered"]
+    N["every night"] --> S["/land-it:sweep: one high-risk area"] --> T["an issue with new bugs"]
     J["revert or incident"] --> K["/land-it:eval add"] --> L["tune REVIEW.md, model, effort"]
     L --> M["/land-it:eval run: keep only if the score rises"]
 ```
@@ -73,6 +75,7 @@ flowchart TD
 | Formatter and linter hooks | **PostToolUse hook.** Per-file `on_edit` commands after every edit; a failure goes straight back to Claude |
 | Review the diff in a fresh context; bug hunt, simplify, end-to-end check | **`/land-it:preflight`**: checks → `/simplify` → `/code-review` → `/security-review` → `/verify`, in that order |
 | `REVIEW.md` written by code owners: what failure looks like, a nit cap, paths to skip, file:line evidence | **`/land-it:init`** writes one for the repo and imports it from CLAUDE.md |
+| Every finding must be answered on the PR: fix it, or resolve the thread with a reason | **`/land-it:respond`**: unresolved threads on the PR (Code Review, the CI workflow, Copilot, people) go into the ledger, get fixed or a reasoned won't-fix, and are replied to and resolved after you confirm |
 | Every finding gets an answer; Pre-existing bugs aren't blamed on the author | **Findings ledger.** Each finding is fixed, won't fix (a reason is required) or pre-existing (from `git blame` against the base). The stamp refuses while any finding is open |
 | The change sets the risk tier; a classifier, plus owner-listed sensitive paths and CI files | **Risk tiers** from paths: CI workflows, CODEOWNERS and land-it's own config are always high, docs are low. Claude may raise a tier from the content, never lower it |
 | Quick / Standard / Deep review per repo | **`review_effort`**: `/code-review` effort per tier, default low / medium / high |
@@ -81,7 +84,8 @@ flowchart TD
 | An agent's approval never counts as a person's | Claude's `gh pr review --approve` is denied; `gh pr merge` asks you unless HEAD is stamped low-tier |
 | PR template: Testing, Risk, How to revert | init installs it; preflight fills it from real command output |
 | AI review and security review on every PR; all threads resolved; stale approvals dismissed | `init --ci --protect`: a GitHub workflow and branch protection, applied only after you confirm |
-| Incidents become evals; a reviewer change is kept only if the score rises | **`/land-it:eval`**: the commit behind a revert becomes a case; `run` scores recall and noise and says keep or revert |
+| Incidents become evals; a reviewer change is kept only if the score rises | **`/land-it:eval`**: the commit behind a revert becomes a case; `run` scores recall and noise and says keep or revert; `eval scan` lists reverts not recorded yet |
+| Nightly review agents scan existing code for old bugs | **`/land-it:sweep`** and a nightly workflow: one `risk.high` area per night by rotation, new bugs filed as one issue, ones already filed skipped |
 | Track human time (approvals per PR, median and p95; human comments; wait time) with reverts and incidents as the guardrail | **`/land-it:stats`**: one-round passes, mean rounds, finding outcomes, the revert rate on the base branch; with `--github`, approvals and human comments per PR and hours to merge, bots excluded |
 | The article's open gap: no circuit breaker yet that tightens approval when reverts move | **Circuit breaker**: while reverts on the base branch are above the threshold, every change's risk floor rises one tier |
 | Measure noise: sort comments by response, run the reviewer on known-clean PRs | `wontfix_pct` in stats; clean eval cases; `--judge` scores the defect with an LLM judge instead of matching a citation |
@@ -109,16 +113,19 @@ Requirements: git, Python 3.9+ (stdlib only, nothing to install), a recent Claud
 3. **Open it:** `gh pr create --body-file <path preflight printed>`. If anything changed after the stamp, the hook says so.
 4. **When something slips through** (a revert, an incident): `/land-it:eval add <the fix or revert>`. Before and
    after you edit REVIEW.md or switch models: `/land-it:eval run`.
-5. **Now and then:** `/land-it:stats`, to see whether review gets faster without more reverts.
+5. **The PR got review comments:** `/land-it:respond`.
+6. **Now and then:** `/land-it:stats`, to see whether review gets faster without more reverts.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `/land-it:init` | Reads the project and writes `.claude/land-it.json` (checks, on-edit formatters, risk paths), a repo-specific `REVIEW.md`, the `@REVIEW.md` import in CLAUDE.md, and a PR template. Optionally a GitHub review + security workflow (`--ci`) and branch protection (`--protect`); both ask before touching GitHub |
+| `/land-it:init` | Reads the project and writes `.claude/land-it.json` (checks, on-edit formatters, risk paths), a repo-specific `REVIEW.md`, the `@REVIEW.md` import in CLAUDE.md, and a PR template. Optionally a GitHub review + security workflow (`--ci`), a nightly bug sweep (`--sweep`) and branch protection (`--protect`); both ask before touching GitHub |
 | `/land-it:preflight` | The pre-PR pipeline: risk tier → review round → checks → simplify → code review → security review → behavior check → findings ledger → stamp → PR body |
 | `/land-it:eval` | `add`: record the commit behind an incident as a case. `run`: review every case under today's rules, score recall and noise, compare with the last run. `list` |
 | `/land-it:trust` | Approve the config's commands. Only a command you type counts; Claude can't invoke it |
+| `/land-it:respond` | Answer every unresolved review thread on a PR: ledger → fix or won't fix → replies and resolution, posted after you confirm |
+| `/land-it:sweep` | Review one area of existing code for old bugs (today's high-risk area, or a path) and file new findings as one issue. `--ci` for the scheduled run |
 | `/land-it:stats` | The article's numbers for this repo, read against its goal: less human time, no more reverts. `--github` adds human time per PR |
 
 ### Review depth by tier
@@ -136,7 +143,7 @@ Requirements: git, Python 3.9+ (stdlib only, nothing to install), a recent Claud
 | `UserPromptSubmit` | Snapshots the working tree, so each turn is judged on its own changes (your edits between turns aren't Claude's) |
 | `PostToolUse` (Edit, Write) | Runs the matching `on_edit` commands on the edited file; a failure goes back to Claude |
 | `Stop` | If the turn changed non-docs files: runs `stop_checks` (path-scoped ones only when touched). Red: blocks the stop with the output, at most 3 times per turn. A docs-only turn, or a stop on the same red tree Claude already saw, passes |
-| `PreToolUse` (Bash) | `gh pr create` needs the stamp on HEAD's tree; `gh pr review --approve` is denied; `gh pr merge` asks you unless HEAD is stamped low; `land-it trust` from Claude's shell is denied |
+| `PreToolUse` (Bash) | `gh pr create` needs the stamp on HEAD's tree; `gh pr review --approve` is denied; `gh pr merge` asks you unless HEAD is stamped low; `land-it trust` from Claude's shell is denied; `land-it threads reply` always asks you, because it posts under your account |
 | `UserPromptExpansion` | When *you* type `/land-it:trust`, records trust for the current commands |
 
 ## Configuration: `.claude/land-it.json`
@@ -207,6 +214,7 @@ your own skill. `--model` and `--effort` compare models and depths.
 | Hooks | Local processes: 0 tokens while checks are green. On red, up to ~1k tokens of output per block, at most 3 per turn |
 | `/land-it:preflight` | Mostly the reviews it runs, scaled by `review_effort` |
 | `/land-it:eval run` | One review per case |
+| `/land-it:sweep` | One review of one area per run; the nightly workflow runs it once a day |
 
 Measured in live runs:
 
@@ -233,7 +241,9 @@ The plugin puts `land-it` on Claude's PATH; the skills call it. You can call it 
 | `land-it stamp [--tier T]` | Bind the green tree and its tier; refuses on open findings or a tier below the path floor |
 | `land-it status` | Trust, green and stamp state for the worktree and HEAD |
 | `land-it trust` | Approve the config's commands, at your own terminal |
-| `land-it eval [list \| add … \| run …]` | Reviewer evals |
+| `land-it eval [list \| scan \| add … \| run …]` | Reviewer evals; `scan` finds reverts that aren't cases yet |
+| `land-it threads [PR \| reply ID --body B --resolve]` | Unresolved review threads on a PR (bots told apart); reply to one and resolve it |
+| `land-it sweep-target [--day N]` | Today's area for the sweep, rotating over `risk.high` |
 | `land-it stats [--days N] [--github]` | One-round passes, rounds, finding outcomes, reverts, the circuit breaker; GitHub human time |
 
 ## What lives where

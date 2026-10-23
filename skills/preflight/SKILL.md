@@ -104,6 +104,8 @@ Write it to the `pr_body` path `stamp` printed:
 
 If the tree is dirty: with the `commit` argument, commit everything that was stamped (one commit, message
 from the intent). Without it, show `git status` and ask the user to commit or let you. Next:
-`gh pr create --body-file <pr_body>`. Merging is the user's call: the hook asks the user for anything above
+`gh pr create --body-file <pr_body>`. Pre-existing findings shouldn't vanish with this PR: offer one follow-up
+issue listing them (`gh issue create`), and file it only on the user's yes. Review comments that arrive on the
+PR later are handled by `/land-it:respond`. Merging is the user's call: the hook asks the user for anything above
 low tier, and Claude never approves PRs. End with a short summary: tier, check results, findings
 fixed / won't fix / pre-existing, and what a human must look at.

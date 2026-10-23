@@ -1,7 +1,7 @@
 ---
 name: init
 description: Set up land-it in the current repository - .claude/land-it.json (checks, on-edit formatters), REVIEW.md, the @REVIEW.md import in CLAUDE.md, a PR template with Testing/Risk/How to revert, and optionally a GitHub review workflow and branch protection. Use when the user asks to set up land-it, a pre-PR pipeline, or review rules for a project.
-argument-hint: "[--ci] [--protect]"
+argument-hint: "[--ci] [--sweep] [--protect]"
 allowed-tools: Bash(land-it *), Bash(git status*), Bash(git rev-parse*)
 ---
 
@@ -72,6 +72,9 @@ exists, add the missing Testing / Risk / How to revert sections to it.
 - **`--ci` / "AI review on every PR"**: copy `templates/workflows/land-it.yml` to `.github/workflows/`.
   Tell the user which secrets it needs and that the Claude GitHub App must be installed (`/install-github-app`).
   If the repo has no CI running its checks, also write a plain CI workflow that runs the same commands.
+- **`--sweep` / "nightly bug sweep"**: copy `templates/workflows/land-it-sweep.yml` to `.github/workflows/`. Each
+  night it reviews one `risk.high` area of existing code and files new bugs as one issue labeled `land-it-sweep`.
+  Same secrets and app as `--ci`. Tell the user what a run costs: one code review of one area per night.
 - **`--protect` / branch protection**: follow `branch-protection.md` next to this file. Ask whether the user
   is solo or a team, fill in OWNER/REPO and check names, show the exact command, run it only on a yes.
 

@@ -1,7 +1,7 @@
 ---
 name: eval
 description: Turn past incidents and reverts into eval cases for the reviewer, run the reviewer against them, and keep a change to REVIEW.md, CLAUDE.md, the model or the effort only if recall rises (or noise drops at equal recall). Use when the user asks to add an incident or revert as a test case, to measure the reviewer, or to check whether a reviewer tweak helped.
-argument-hint: "add <revert/fix commit or PR> | run [--model M] [--effort E] | list"
+argument-hint: "scan | add <revert/fix commit or PR> | run [--model M] [--effort E] [--judge M] | list"
 allowed-tools: Bash(land-it *), Bash(git log*), Bash(git show*), Bash(git blame*), Bash(gh pr view*), Bash(gh pr diff*)
 ---
 
@@ -12,6 +12,9 @@ Talk to the user in their language. If `land-it` isn't on PATH, call
 they are the repo's memory of what the reviewer missed. Results go to `.land-it/evals/history.jsonl`.
 
 ## add: an incident becomes a case
+
+`land-it eval scan [--days N]` lists reverts on the base branch whose reverted commit isn't a case yet: the
+backlog of incidents. Offer them to the user one by one.
 
 The user points at a revert, a fix commit, a PR or an incident. Find **the change that introduced the bug**:
 - a revert says `This reverts commit <sha>`: that sha is the bad change;

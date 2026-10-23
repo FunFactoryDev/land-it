@@ -463,5 +463,95 @@ class Measure(unittest.TestCase):
         self.assertEqual(gh["hours_to_merge"]["median"], 10.0)
 
 
+
+FAKE_GH = """#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["GH_LOG"], "a") as f:
+    f.write(json.dumps(args) + "\\n")
+if args[:2] == ["pr", "view"]:
+    print(42)
+elif any("reviewThreads" in a for a in args):
+    bot, human = {"__typename": "Bot", "login": "claude"}, {"__typename": "User", "login": "alice"}
+    for t in [{"id": "T1", "isResolved": False, "isOutdated": False, "path": "a.py", "line": 2,
+               "comments": {"nodes": [{"author": bot, "body": "Important: y is None", "url": "u1"}]}},
+              {"id": "T2", "isResolved": True, "path": "a.py", "line": 1, "comments": {"nodes": [{"author": human, "body": "ok"}]}},
+              {"id": "T3", "isResolved": False, "isOutdated": True, "path": "b.py", "line": 5,
+               "comments": {"nodes": [{"author": human, "body": "why?", "url": "u3"}, {"author": bot, "body": "because"}]}}]:
+        print(json.dumps(t))
+elif any("addPullRequestReviewThreadReply" in a for a in args):
+    print(json.dumps({"data": {"addPullRequestReviewThreadReply": {"comment": {"url": "https://example/reply"}}}}))
+else:
+    print(json.dumps({"data": {"resolveReviewThread": {"thread": {"isResolved": True}}}}))
+"""
+
+
+class GitHubLoop(unittest.TestCase):
+    def setUp(self):
+        self.r = Repo(self, {})
+        self.fake = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.fake)
+        with open(os.path.join(self.fake, "gh"), "w") as f:
+            f.write(FAKE_GH)
+        os.chmod(os.path.join(self.fake, "gh"), 0o755)
+        self.log = os.path.join(self.fake, "log")
+        self.env = {"PATH": self.fake + os.pathsep + os.environ["PATH"], "GH_LOG": self.log}
+
+    def calls(self):
+        with open(self.log) as f:
+            return [json.loads(ln) for ln in f]
+
+    def test_lists_only_unresolved_threads_for_this_branch_pr(self):
+        out = json.loads(self.r.cli("threads", env=self.env).stdout)
+        self.assertEqual(out["pr"], 42)
+        self.assertEqual([(t["id"], t["bot"], t["replies"]) for t in out["unresolved"]], [("T1", True, 0), ("T3", False, 1)])
+        self.assertIn("pr=42", self.calls()[-1])
+        self.assertEqual(json.loads(self.r.cli("threads", "7", env=self.env).stdout)["pr"], 7)
+        self.assertIn("pr=7", self.calls()[-1])
+
+    def test_reply_and_resolve(self):
+        out = json.loads(self.r.cli("threads", "reply", "T1", "--body", "Fixed in abc123", "--resolve", env=self.env).stdout)
+        self.assertEqual(out, {"replied": "https://example/reply", "resolved": True})
+        reply, resolve = self.calls()
+        self.assertIn("body=Fixed in abc123", reply)
+        self.assertTrue(any("resolveReviewThread" in a for a in resolve) and "id=T1" in resolve)
+
+    def test_replying_always_asks_the_user(self):
+        out = self.r.hook("pre-bash", tool_input={"command": "land-it threads reply T1 --body 'won't fix: intended'"})
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertIsNone(self.r.hook("pre-bash", tool_input={"command": "land-it threads"}))
+
+
+class Sweep(unittest.TestCase):
+    def test_rotates_over_high_risk_areas(self):
+        r = Repo(self, {"risk": {"high": ["src/billing/**", "src/auth/**", "*.sql", "src/none/**"]}})
+        for path in ("src/billing/a.py", "src/auth/b.py", "db/x.sql"):
+            r.write(path, "x\n")
+        r.commit("areas")
+        picks = [json.loads(r.cli("sweep-target", "--day", str(d)).stdout)["target"] for d in (0, 1, 2)]
+        self.assertEqual(picks, ["src/auth", "src/billing", "src/auth"], "no-prefix and empty globs are skipped")
+
+    def test_falls_back_to_top_level_dirs(self):
+        r = Repo(self, {})
+        for path in ("app/main.py", "docs/a.md", "tests/t.py", "lib/u.py"):
+            r.write(path, "x\n")
+        r.commit("dirs")
+        out = json.loads(r.cli("sweep-target", "--day", "0").stdout)
+        self.assertEqual((out["candidates"], out["from"]), (["app", "lib"], "top-level directories"))
+
+
+class EvalScan(unittest.TestCase):
+    def test_finds_reverts_not_yet_recorded(self):
+        r = Repo(self, {})
+        r.write("a.py", "x = 'bad'\n")
+        r.commit("ship a bad change")
+        bad = sh(r.root, "git", "rev-parse", "HEAD").strip()
+        sh(r.root, "git", "revert", "--no-edit", "HEAD")
+        found = json.loads(r.cli("eval", "scan").stdout)
+        self.assertEqual([f["reverted"] for f in found], [bad])
+        r.cli("eval", "add", "--commit", bad, "--file", "a.py", "--line", "1", "--summary", "bad value")
+        self.assertEqual(json.loads(r.cli("eval", "scan").stdout), [])
+
+
 if __name__ == "__main__":
     unittest.main()
