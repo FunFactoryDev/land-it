@@ -39,9 +39,14 @@ Package.swift / *.xcodeproj, Makefile, existing CI workflows) and write the conf
   only for a repo where one missed bug costs more than a long, expensive review.
 - `base`: the branch PRs target, when it isn't `origin/HEAD`, `main` or `master`.
 
-Then run `land-it check` and show the output. A check that fails because the tool is missing or the
-command is wrong: fix the config. A check that fails on real problems in the code: keep it and tell the user;
-the repo starts red.
+- A check may be `{"run": "...", "paths": ["web/**"]}`: it runs only when the change touches those paths.
+  Use it in monorepos so a change in one package doesn't wait on every package's suite.
+
+land-it runs these commands only after the user trusts them, so a config edit can't turn into command
+execution. Show the user every command you wrote and ask them to type `/land-it:trust`. You can't do it for
+them, and `land-it trust` from your shell is refused by design. After they have, run `land-it check` and
+show the output. A check that fails because the tool is missing or the command is wrong: fix the config (they'll
+need to trust it again). A check that fails on real problems in the code: keep it and tell the user; the repo starts red.
 
 ## 3. REVIEW.md
 

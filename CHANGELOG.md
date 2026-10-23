@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0
+
+**Upgrading:** in each repo, type `/land-it:trust` once. Until then land-it's hooks and `land-it check` won't run
+the config's commands.
+
+- Trust: `checks` and `on_edit` run only after the user approves them. A hash per repo is pinned in
+  `~/.land-it/trust.json`; any command change needs approval again. Approval comes from the user typing
+  `/land-it:trust` (a `UserPromptExpansion` hook, which never fires for skills the model invokes; the skill is
+  user-only), or `land-it trust` at a terminal outside Claude Code. Claude's `land-it trust` is denied. This closes
+  a path from "Claude may edit files" to "Claude may run commands" through the Stop hook.
+- Turn snapshots: a `UserPromptSubmit` hook snapshots the tree, so the Stop gate sees every change made during the
+  turn, including through Bash (`sed -i`), and doesn't blame Claude for your edits between turns.
+- Path-scoped checks: `{"run": "...", "paths": ["web/**"]}` runs only when the change touches those paths.
+- The repo now uses land-it on itself (`.claude/land-it.json`).
+- README in English and Russian, with the article this plugin is based on, the trust model and measured token costs.
+
 ## 0.3.0
 
 - `/land-it:eval` and `land-it eval add|run|list`: past incidents become reviewer test cases (bug cases with

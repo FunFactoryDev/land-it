@@ -1,6 +1,21 @@
 {
-  "description": "land-it: format/lint on edit, checks before Claude says done, preflight stamp before gh pr create. Silent in repos without .claude/land-it.json.",
+  "description": "land-it: format/lint on edit, checks before Claude says done, preflight stamp before gh pr create, user-only trust for config commands. Silent in repos without .claude/land-it.json.",
   "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/land-it", "hook", "prompt"], "timeout": 60 }
+        ]
+      }
+    ],
+    "UserPromptExpansion": [
+      {
+        "matcher": "land-it:trust",
+        "hooks": [
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/land-it", "hook", "expand"], "timeout": 30 }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit",

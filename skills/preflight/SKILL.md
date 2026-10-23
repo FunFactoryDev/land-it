@@ -32,7 +32,8 @@ the tier and the reason in one line.
 
 ## 3. Checks
 
-`land-it check`. Red → fix the cause, re-run, repeat. Never edit a test or a check to make it pass
+`land-it check`. If it says the commands aren't trusted, stop: show the user the commands and ask them to
+type `/land-it:trust`. Red → fix the cause, re-run, repeat. Never edit a test or a check to make it pass
 unless the test is wrong, and then say so. Stop and ask after three failed attempts at the same failure.
 
 ## 4. Depth by tier

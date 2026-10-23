@@ -57,6 +57,53 @@ def tail(text, n=TAIL):
     return text if len(text) <= n else "...\n" + text[-n:]
 
 
+# --- trust: config commands run only after the user approves them ----------------
+# Without this, an edit to the config (say by Claude under prompt injection, in a mode
+# that auto-accepts edits) would turn into command execution through the hooks.
+
+def trust_file():
+    return os.path.join(os.environ.get("LAND_IT_HOME") or os.path.expanduser("~/.land-it"), "trust.json")
+
+
+def commands_digest(cfg):
+    blob = json.dumps({"checks": cfg.get("checks") or {}, "on_edit": cfg.get("on_edit") or {}}, sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def trust_store():
+    try:
+        with open(trust_file()) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def is_trusted(root, cfg):
+    if not (cfg.get("checks") or cfg.get("on_edit")):
+        return True
+    return trust_store().get(os.path.realpath(root)) == commands_digest(cfg)
+
+
+def record_trust(root, cfg):
+    store = trust_store()
+    store[os.path.realpath(root)] = commands_digest(cfg)
+    os.makedirs(os.path.dirname(trust_file()), exist_ok=True)
+    with open(trust_file() + ".tmp", "w") as f:
+        json.dump(store, f, indent=1)
+    os.replace(trust_file() + ".tmp", trust_file())
+
+
+def command_lines(cfg):
+    return (["check %s: %s" % (name, cmd) for name, cmd, _ in check_specs(cfg)]
+            + ["on_edit %s: %s" % (g, c) for g, c in (cfg.get("on_edit") or {}).items()])
+
+
+def untrusted_message(cfg):
+    return ("land-it: the commands in %s are new or changed since they were last trusted, so they didn't run:\n  %s\n"
+            "Review them, then type /land-it:trust. Only the user can; Claude can't approve them."
+            % (CONFIG, "\n  ".join(command_lines(cfg))))
+
+
 # --- globs -----------------------------------------------------------------
 
 @functools.lru_cache(maxsize=None)
@@ -272,29 +319,43 @@ def cmd_findings(root, cfg, a):
 
 # --- checks ------------------------------------------------------------------
 
-def run_checks(root, cfg, only=None):
-    """Run configured checks in order, stop at the first failure. -> (ok, ran_all, log)"""
-    checks = cfg.get("checks") or {}
-    log, ran = [], 0
-    for name, cmd in checks.items():
+def check_specs(cfg):
+    """checks: name -> "command" or {"run": "command", "paths": [globs]}"""
+    for name, spec in (cfg.get("checks") or {}).items():
+        spec = {"run": spec} if isinstance(spec, str) else spec
+        yield name, spec["run"], spec.get("paths")
+
+
+def run_checks(root, cfg, only=None, files=None):
+    """Run checks in order, stop at the first failure. A check with `paths` runs only when one of
+    `files` matches them (files=None: always). -> (ok, names not run, log)"""
+    specs, log, skipped = list(check_specs(cfg)), [], []
+    for name, cmd, paths in specs:
         if only is not None and name not in only:
+            skipped.append(name)
+            continue
+        if paths and files is not None and not any(matches(p, f) for p in paths for f in files):
+            skipped.append(name)
+            log.append("== %s: skipped, no changed file under %s" % (name, ", ".join(paths)))
             continue
         t = time.time()
         r = subprocess.run(cmd, shell=True, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         verdict = "PASS" if r.returncode == 0 else "FAIL (exit %d)" % r.returncode
         log.append("== %s: %s\n%s== %s: %s in %.1fs" % (name, cmd, r.stdout, name, verdict, time.time() - t))
-        ran += 1
         if r.returncode:
-            return False, False, "\n".join(log)
-    if not checks:
+            return False, skipped, "\n".join(log)
+    if not specs:
         log.append("== no checks configured in %s" % CONFIG)
-    return True, ran == len(checks), "\n".join(log)
+    return True, skipped, "\n".join(log)
 
 
 def cmd_check(root, cfg, a):
-    ok, ran_all, log = run_checks(root, cfg)
+    if not is_trusted(root, cfg):
+        die(untrusted_message(cfg))
+    # checks skipped by `paths` don't apply to this change, so a pass still makes the tree green
+    ok, _, log = run_checks(root, cfg, files=changed_files(root, cfg))
     print(log)
-    if ok and ran_all:
+    if ok:
         tree = worktree_tree(root)
         with locked_state(root) as st:
             st["green"] = tree
@@ -323,6 +384,7 @@ def cmd_status(root, cfg, a):
     stamp = st.get("stamp") or {}
     print(json.dumps({
         "checks": list((cfg.get("checks") or {}).keys()),
+        "commands_trusted": is_trusted(root, cfg),
         "checks_green_for_worktree": st.get("green") == tree,
         "stamp_matches_worktree": stamp.get("tree") == tree,
         "stamp_matches_head": bool(head) and stamp.get("tree") == head,
@@ -490,6 +552,38 @@ def emit(obj):
     sys.exit(0)
 
 
+def prune(sessions, now):
+    for sid in [s for s, e in sessions.items() if now - e.get("at", 0) > 7 * DAY]:
+        del sessions[sid]
+
+
+def settle(st, sid, tree):
+    """The turn's changes are accounted for: later stops in this turn compare against `tree`."""
+    st.setdefault("dirty", {}).pop(sid, None)
+    st.setdefault("turn", {})[sid] = {"tree": tree, "at": int(time.time())}
+
+
+def hook_prompt(data, root, cfg):
+    """A new turn is judged on its own changes, so the user's edits between turns aren't Claude's."""
+    if cfg.get("stop_gate") is False:
+        return
+    tree, now = worktree_tree(root), int(time.time())
+    with locked_state(root) as st:
+        prune(st.setdefault("turn", {}), now)
+        settle(st, data.get("session_id", "?"), tree)
+
+
+def hook_expand(data, root, cfg):
+    """Trust is recorded only from a command the user typed: Claude invoking a skill doesn't fire this."""
+    if data.get("command_name") != "land-it:trust":
+        return
+    record_trust(root, cfg)
+    emit({"systemMessage": "land-it: commands trusted for %s" % root,
+          "hookSpecificOutput": {"hookEventName": "UserPromptExpansion", "additionalContext":
+                                 "land-it recorded the user's trust for these commands in %s:\n  %s"
+                                 % (root, "\n  ".join(command_lines(cfg)) or "(none)")}})
+
+
 def hook_post_edit(data, root, cfg):
     path = (data.get("tool_input") or {}).get("file_path")
     if not path:
@@ -498,17 +592,25 @@ def hook_post_edit(data, root, cfg):
     rel = os.path.relpath(os.path.realpath(path), os.path.realpath(root))
     if rel.startswith(".."):
         return
-    now = int(time.time())
+    sid, now = data.get("session_id", "?"), int(time.time())
+    on_edit, trusted = cfg.get("on_edit") or {}, is_trusted(root, cfg)
     with locked_state(root) as st:
-        dirty = st.setdefault("dirty", {})
-        for sid in [s for s, e in dirty.items() if now - e.get("at", 0) > 7 * DAY]:
-            del dirty[sid]
-        entry = dirty.setdefault(data.get("session_id", "?"), {"files": []})
+        dirty, warned = st.setdefault("dirty", {}), st.setdefault("warned", {})
+        prune(dirty, now)
+        prune(warned, now)
+        entry = dirty.setdefault(sid, {"files": []})
         entry["at"] = now
         if rel not in entry["files"]:
             entry["files"].append(rel)
+        first_warning = on_edit and not trusted and sid not in warned
+        if first_warning:
+            warned[sid] = {"at": now}
+    if not trusted:
+        if first_warning:  # once per session, not on every edit
+            emit({"systemMessage": untrusted_message(cfg)})
+        return
     problems = []
-    for pat, cmd in (cfg.get("on_edit") or {}).items():
+    for pat, cmd in on_edit.items():
         if matches(pat, rel) and os.path.exists(path):
             cmd = cmd.replace("{file}", shlex.quote(path))
             r = subprocess.run(cmd, shell=True, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -523,35 +625,39 @@ def hook_stop(data, root, cfg):
     if cfg.get("stop_gate") is False:
         return
     sid = data.get("session_id", "?")
-    entry = (load_state(root).get("dirty") or {}).get(sid)
-    if not entry:
-        return
-    if all(file_tier(f, cfg) == "low" for f in entry.get("files", [])):
-        with locked_state(root) as st:  # docs-only turn: nothing for the checks to prove
-            st.get("dirty", {}).pop(sid, None)
-        return
+    st = load_state(root)
+    entry = (st.get("dirty") or {}).get(sid) or {}
+    base = ((st.get("turn") or {}).get(sid) or {}).get("tree")
     tree = worktree_tree(root)
-    if load_state(root).get("green") == tree or entry.get("red") == tree:
-        # green: nothing to prove. red on this exact tree: Claude already saw the
-        # failure and chose to stop (e.g. to ask the user); re-running changes nothing.
+    files = set(entry.get("files", []))
+    if base and base != tree:  # the turn's snapshot also catches edits made through Bash
+        files.update(filter(None, git(root, "diff", "--name-only", base, tree, check=False).splitlines()))
+    if not files or st.get("green") == tree or entry.get("red") == tree:
+        # nothing changed this turn, or already green, or red on this exact tree: Claude saw the
+        # failure and chose to stop (e.g. to ask the user), and re-running would change nothing
         return
-    ok, ran_all, log = run_checks(root, cfg, cfg.get("stop_checks"))
+    if all(file_tier(f, cfg) == "low" for f in files) or not is_trusted(root, cfg):
+        with locked_state(root) as st:  # docs-only turn: nothing for the checks to prove
+            settle(st, sid, tree)
+        if not is_trusted(root, cfg):
+            emit({"systemMessage": untrusted_message(cfg)})
+        return
+    ok, skipped, log = run_checks(root, cfg, cfg.get("stop_checks"), files=sorted(files))
     with locked_state(root) as st:
-        dirty = st.setdefault("dirty", {})
         if ok:
-            dirty.pop(sid, None)
-            if ran_all:
+            settle(st, sid, tree)
+            if not skipped:  # a subset passing doesn't make the whole tree green
                 st["green"] = tree
         else:
-            e = dirty.setdefault(sid, entry)
-            e["red"], e["blocks"] = tree, e.get("blocks", 0) + 1
+            e = st.setdefault("dirty", {}).setdefault(sid, {"files": sorted(files)})
+            e["at"], e["red"], e["blocks"] = int(time.time()), tree, e.get("blocks", 0) + 1
             blocks = e["blocks"]
     if ok:
-        emit({"systemMessage": "land-it: checks green after this turn's edits"})
+        emit({"systemMessage": "land-it: checks green after this turn's changes"})
     if blocks > MAX_STOP_BLOCKS:
         emit({"systemMessage": "land-it: checks still red after %d tries; over to you.\n%s" % (MAX_STOP_BLOCKS, tail(log, 800))})
     emit({"decision": "block", "reason":
-          "land-it: checks fail after your edits. Fix them, re-run, and show the output; "
+          "land-it: checks fail after your changes. Fix them, re-run, and show the output; "
           "don't report done on a red tree. If you are deliberately pausing (to ask the user), "
           "say so and stop again without changes.\n\n" + tail(log)})
 
@@ -559,6 +665,7 @@ def hook_stop(data, root, cfg):
 GH_PR_CREATE = re.compile(r"\bgh\s+pr\s+create\b")
 GH_PR_MERGE = re.compile(r"\bgh\s+pr\s+merge\b([^;&|\n]*)")
 GH_PR_APPROVE = re.compile(r"\bgh\s+pr\s+review\b[^;&|\n]*(?:--approve|\s-a\b)")
+TRUST_CMD = re.compile(r"land-it\S*\s+trust\b")
 
 
 def decide(decision, reason):
@@ -568,6 +675,8 @@ def decide(decision, reason):
 
 def hook_pre_bash(data, root, cfg):
     cmd = (data.get("tool_input") or {}).get("command") or ""
+    if TRUST_CMD.search(cmd):
+        decide("deny", "land-it: only the user can trust config commands, by typing /land-it:trust.")
     create, merge, approve = GH_PR_CREATE.search(cmd), GH_PR_MERGE.search(cmd), GH_PR_APPROVE.search(cmd)
     if not (create or merge or approve):
         return
@@ -590,7 +699,19 @@ def hook_pre_bash(data, root, cfg):
                    "counts as a person's. Only low-tier changes with green checks merge on automation alone." % tier)
 
 
-HOOKS = {"post-edit": hook_post_edit, "stop": hook_stop, "pre-bash": hook_pre_bash}
+HOOKS = {"post-edit": hook_post_edit, "stop": hook_stop, "pre-bash": hook_pre_bash,
+         "prompt": hook_prompt, "expand": hook_expand}
+
+
+def cmd_trust(root, cfg, a):
+    """For a terminal outside Claude Code; inside it, the user types /land-it:trust."""
+    if os.environ.get("CLAUDECODE") or not sys.stdin.isatty():
+        die("trust needs you at a terminal; in Claude Code, type /land-it:trust instead")
+    print("Commands in %s for %s:\n  %s" % (CONFIG, root, "\n  ".join(command_lines(cfg)) or "(none)"))
+    if input("Trust these commands? [y/N] ").strip().lower() not in ("y", "yes"):
+        die("not trusted")
+    record_trust(root, cfg)
+    print("trusted")
 
 
 def run_hook(event):
@@ -619,6 +740,7 @@ def main(argv=None):
     s = sub.add_parser("stamp", help="bind the green tree and its tier to a preflight stamp")
     s.add_argument("--tier", choices=TIERS, help="raise the tier above the path-based floor")
     sub.add_parser("status", help="show green/stamp state for the worktree and HEAD")
+    sub.add_parser("trust", help="approve the config's commands (at your own terminal)")
     e = sub.add_parser("eval", help="reviewer evals from past incidents: list, add, run")
     e.add_argument("action", nargs="?", default="list", choices=["list", "add", "run"])
     e.add_argument("--commit", help="add: the commit that introduced the bug (reviewed as SHA^..SHA)")
@@ -645,7 +767,7 @@ def main(argv=None):
     if cfg is None:
         die("no %s here; run /land-it:init" % CONFIG)
     {"check": cmd_check, "risk": cmd_risk, "round": cmd_round, "findings": cmd_findings,
-     "stamp": cmd_stamp, "status": cmd_status, "eval": cmd_eval}[a.cmd](root, cfg, a)
+     "stamp": cmd_stamp, "status": cmd_status, "eval": cmd_eval, "trust": cmd_trust}[a.cmd](root, cfg, a)
 
 
 if __name__ == "__main__":

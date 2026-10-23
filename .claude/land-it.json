@@ -1,0 +1,11 @@
+{
+  "checks": {
+    "test": "python3 -m unittest discover tests",
+    "validate": "claude plugin validate ."
+  },
+  "stop_checks": ["test"],
+  "risk": {
+    "high": ["bin/**", "hooks/**"],
+    "medium": ["skills/**", "templates/**"]
+  }
+}
