@@ -8,5 +8,10 @@
   "on_edit": {
     "*.{ts,tsx,js,jsx,css,json}": "npx prettier --write {file}"
   },
-  "stop_checks": ["lint", "typecheck", "test"]
+  "stop_checks": ["lint", "typecheck", "test"],
+  "risk": {
+    "high": ["src/auth/**", "src/billing/**", "migrations/**", "scripts/release*"],
+    "low": ["**/__fixtures__/**", "src/generated/**"]
+  },
+  "max_rounds": 3
 }

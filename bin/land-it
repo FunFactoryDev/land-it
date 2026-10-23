@@ -99,24 +99,24 @@ def state_dir(root):
     return os.path.join(git(root, "rev-parse", "--absolute-git-dir"), "land-it")
 
 
-def load_state(root):
+def load_state(root, name="state.json"):
     try:
-        with open(os.path.join(state_dir(root), "state.json")) as f:
+        with open(os.path.join(state_dir(root), name)) as f:
             return json.load(f)
     except FileNotFoundError:
         return {}
 
 
 @contextlib.contextmanager
-def locked_state(root):
+def locked_state(root, name="state.json"):
     d = state_dir(root)
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "lock"), "w") as lock:
         if fcntl:
             fcntl.flock(lock, fcntl.LOCK_EX)
-        st = load_state(root)
+        st = load_state(root, name)
         yield st
-        path = os.path.join(d, "state.json")
+        path = os.path.join(d, name)
         with open(path + ".tmp", "w") as f:
             json.dump(st, f, indent=1)
         os.replace(path + ".tmp", path)
@@ -138,6 +138,131 @@ def worktree_tree(root):
 
 def head_tree(root):
     return git(root, "rev-parse", "HEAD^{tree}", check=False)
+
+
+# --- risk: the change sets the tier, not the author -----------------------------
+
+TIERS = ["low", "medium", "high"]
+# Config can't lower these: CI and the gate's own config decide what every other change must pass.
+ALWAYS_HIGH = [".github/workflows/**", ".gitlab-ci.yml", "CODEOWNERS", CONFIG]
+DEFAULT_RISK = {"medium": ["CLAUDE.md", "REVIEW.md", ".claude/**"], "low": ["*.md", "docs/**", "LICENSE*"]}
+
+
+def file_tier(path, cfg):
+    if any(matches(p, path) for p in ALWAYS_HIGH):
+        return "high"
+    user = cfg.get("risk") or {}
+    for tier in ("high", "medium", "low"):
+        if any(matches(p, path) for p in user.get(tier, [])):
+            return tier
+    for tier in ("medium", "low"):
+        if any(matches(p, path) for p in DEFAULT_RISK[tier]):
+            return tier
+    return "medium"
+
+
+def classify(files, cfg):
+    per = {f: file_tier(f, cfg) for f in files}
+    return max(per.values(), key=TIERS.index, default="low"), per
+
+
+def merge_base(root, cfg):
+    base = cfg.get("base") or git(root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
+    if not base:
+        base = next((b for b in ("main", "master") if git(root, "rev-parse", "--verify", "--quiet", b, check=False)), "")
+    return git(root, "merge-base", "HEAD", base, check=False) if base else ""
+
+
+def changed_files(root, cfg):
+    """Files that differ from the merge base, uncommitted and untracked included."""
+    tracked = git(root, "diff", "--name-only", merge_base(root, cfg) or "HEAD", check=False)
+    untracked = git(root, "ls-files", "--others", "--exclude-standard", check=False)
+    return sorted(set(filter(None, (tracked + "\n" + untracked).splitlines())))
+
+
+def cmd_risk(root, cfg, a):
+    tier, per = classify(changed_files(root, cfg), cfg)
+    print(json.dumps({"tier": tier, "files": per}, indent=1))
+
+
+# --- review rounds and findings, per branch -------------------------------------
+
+def ledger_name(root):
+    branch = git(root, "rev-parse", "--abbrev-ref", "HEAD", check=False) or "unborn"
+    return "ledger-%s.json" % re.sub(r"[^\w.-]", "_", branch)
+
+
+def cmd_round(root, cfg, a):
+    tree, head = worktree_tree(root), git(root, "rev-parse", "HEAD", check=False)
+    with locked_state(root, ledger_name(root)) as led:
+        if a.reset:
+            led.clear()
+            print(json.dumps({"reset": True}))
+            return
+        rounds = led.setdefault("rounds", [])
+        fresh = not rounds or rounds[-1]["tree"] != tree
+        if fresh:
+            # a dangling commit of the worktree, so later rounds can name an exact range
+            snap = git(root, "commit-tree", tree, "-m", "land-it review snapshot", *(["-p", head] if head else []))
+            rounds.append({"n": len(rounds) + 1, "tree": tree, "snap": snap, "at": int(time.time())})
+    cur, prev = rounds[-1], (rounds[-2] if len(rounds) > 1 else None)
+    cap = cfg.get("max_rounds", 3)
+    print(json.dumps({
+        "round": cur["n"],
+        "max_rounds": cap,
+        "over_cap": cur["n"] > cap,
+        "already_reviewed": not fresh,
+        # round 1 reviews the whole change; later rounds only what changed since the previous one
+        "target": "%s..%s" % (prev["snap"], cur["snap"]) if prev else "",
+    }, indent=1))
+
+
+def introduced_before(root, path, line, base):
+    """True when blame puts the line in a commit already on the base: a pre-existing bug."""
+    m = re.match(r"\d+", str(line or ""))
+    if not (base and m):
+        return False
+    out = git(root, "blame", "--porcelain", "-L", "%s,%s" % (m.group(), m.group()), "--", path, check=False)
+    sha = out.split(" ", 1)[0]
+    if not sha or set(sha) == {"0"}:
+        return False
+    return subprocess.run(["git", "merge-base", "--is-ancestor", sha, base], cwd=root).returncode == 0
+
+
+def cmd_findings(root, cfg, a):
+    name = ledger_name(root)
+    if a.action == "add":
+        new, base = json.load(sys.stdin), merge_base(root, cfg)
+        with locked_state(root, name) as led:
+            fs, added = led.setdefault("findings", []), []
+            seen = {(x["file"], x["summary"].strip().lower()) for x in fs}
+            for f in new:
+                path = os.path.relpath(os.path.join(root, f["file"]), root)
+                key = (path, f["summary"].strip().lower())
+                if key in seen:
+                    continue  # never post the same finding twice
+                seen.add(key)
+                item = {"id": "F%d" % (len(fs) + 1), "round": len(led.get("rounds", [])) or 1, "file": path,
+                        "line": f.get("line"), "summary": f["summary"], "severity": f.get("severity", "important"),
+                        "status": "pre-existing" if introduced_before(root, path, f.get("line"), base) else "open",
+                        "reason": ""}
+                fs.append(item)
+                added.append(item)
+        print(json.dumps(added, indent=1))
+    elif a.action == "resolve":
+        if not (a.id and a.status):
+            die("usage: land-it findings resolve F3 --status fixed|wontfix|pre-existing|open [--reason ...]")
+        if a.status == "wontfix" and not a.reason:
+            die("wontfix needs --reason")
+        with locked_state(root, name) as led:
+            item = next((x for x in led.get("findings", []) if x["id"] == a.id), None)
+            if item is None:
+                die("no finding %s" % a.id)
+            item["status"], item["reason"] = a.status, a.reason or ""
+        print(json.dumps(item, indent=1))
+    else:
+        led = load_state(root, name)
+        print(json.dumps({"rounds": len(led.get("rounds", [])), "findings": led.get("findings", [])}, indent=1))
 
 
 # --- checks ------------------------------------------------------------------
@@ -174,11 +299,18 @@ def cmd_check(root, cfg, a):
 
 def cmd_stamp(root, cfg, a):
     tree = worktree_tree(root)
+    floor, _ = classify(changed_files(root, cfg), cfg)
+    tier = a.tier or floor
+    if TIERS.index(tier) < TIERS.index(floor):
+        die("tier %s is below %s from the changed paths: a tier can be raised, never lowered" % (tier, floor))
+    unanswered = [x["id"] for x in load_state(root, ledger_name(root)).get("findings", []) if x["status"] == "open"]
+    if unanswered:
+        die("unanswered findings %s: resolve each one (fixed, or wontfix --reason)" % ", ".join(unanswered))
     with locked_state(root) as st:
         if st.get("green") != tree:
             die("checks are not green for the current tree; run `land-it check` first")
-        st["stamp"] = {"tree": tree, "at": int(time.time())}
-    print(json.dumps({"stamped": tree, "pr_body": os.path.join(state_dir(root), "pr-body.md")}, indent=1))
+        st["stamp"] = {"tree": tree, "tier": tier, "at": int(time.time())}
+    print(json.dumps({"stamped": tree, "tier": tier, "pr_body": os.path.join(state_dir(root), "pr-body.md")}, indent=1))
 
 
 def cmd_status(root, cfg, a):
@@ -189,6 +321,7 @@ def cmd_status(root, cfg, a):
         "checks_green_for_worktree": st.get("green") == tree,
         "stamp_matches_worktree": stamp.get("tree") == tree,
         "stamp_matches_head": bool(head) and stamp.get("tree") == head,
+        "stamp_tier": stamp.get("tier"),
         "state_dir": state_dir(root),
     }, indent=1))
 
@@ -236,6 +369,10 @@ def hook_stop(data, root, cfg):
     entry = (load_state(root).get("dirty") or {}).get(sid)
     if not entry:
         return
+    if all(file_tier(f, cfg) == "low" for f in entry.get("files", [])):
+        with locked_state(root) as st:  # docs-only turn: nothing for the checks to prove
+            st.get("dirty", {}).pop(sid, None)
+        return
     tree = worktree_tree(root)
     if load_state(root).get("green") == tree or entry.get("red") == tree:
         # green: nothing to prove. red on this exact tree: Claude already saw the
@@ -263,21 +400,37 @@ def hook_stop(data, root, cfg):
 
 
 GH_PR_CREATE = re.compile(r"\bgh\s+pr\s+create\b")
+GH_PR_MERGE = re.compile(r"\bgh\s+pr\s+merge\b([^;&|\n]*)")
+GH_PR_APPROVE = re.compile(r"\bgh\s+pr\s+review\b[^;&|\n]*(?:--approve|\s-a\b)")
 
 
-def deny(reason):
-    emit({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+def decide(decision, reason):
+    emit({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision,
                                  "permissionDecisionReason": reason}})
 
 
 def hook_pre_bash(data, root, cfg):
     cmd = (data.get("tool_input") or {}).get("command") or ""
-    if GH_PR_CREATE.search(cmd):
-        stamp = load_state(root).get("stamp") or {}
-        if not stamp.get("tree") or stamp["tree"] != head_tree(root):
-            deny("land-it: HEAD has no preflight stamp, or it changed after the stamp. Run /land-it:preflight "
-                 "(the stamp covers exactly the tree it checked), commit everything it checked, then create the PR. "
-                 "To skip deliberately, the user can run the command themselves.")
+    create, merge, approve = GH_PR_CREATE.search(cmd), GH_PR_MERGE.search(cmd), GH_PR_APPROVE.search(cmd)
+    if not (create or merge or approve):
+        return
+    if approve:
+        decide("deny", "land-it: an agent's approval never counts as a person's. Approving a PR is for a human.")
+    stamp = load_state(root).get("stamp") or {}
+    stamped_head = bool(stamp.get("tree")) and stamp["tree"] == head_tree(root)
+    if create and not stamped_head:
+        decide("deny", "land-it: HEAD has no preflight stamp, or it changed after the stamp. Run /land-it:preflight "
+               "(the stamp covers exactly the tree it checked), commit everything it checked, then create the PR. "
+               "To skip deliberately, the user can run the command themselves.")
+    if merge:
+        try:
+            other_pr = [t for t in shlex.split(merge.group(1)) if not t.startswith("-")]
+        except ValueError:
+            other_pr = ["?"]
+        if other_pr or not stamped_head or stamp.get("tier") != "low":
+            tier = stamp.get("tier") if stamped_head else "unknown (no stamp for HEAD)"
+            decide("ask", "land-it: merging a change of tier %s is a human call; an agent's approval never "
+                   "counts as a person's. Only low-tier changes with green checks merge on automation alone." % tier)
 
 
 HOOKS = {"post-edit": hook_post_edit, "stop": hook_stop, "pre-bash": hook_pre_bash}
@@ -298,7 +451,16 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="land-it", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("check", help="run configured checks; on success mark the tree green")
-    sub.add_parser("stamp", help="bind the green tree to a preflight stamp (gates `gh pr create`)")
+    sub.add_parser("risk", help="risk tier of the change vs the merge base, per file")
+    r = sub.add_parser("round", help="start a review round: number, cap, and the diff-only target")
+    r.add_argument("--reset", action="store_true", help="forget rounds and findings for this branch")
+    f = sub.add_parser("findings", help="the branch's findings ledger: list, add (JSON on stdin), resolve")
+    f.add_argument("action", nargs="?", default="list", choices=["list", "add", "resolve"])
+    f.add_argument("id", nargs="?")
+    f.add_argument("--status", choices=["fixed", "wontfix", "pre-existing", "open"])
+    f.add_argument("--reason")
+    s = sub.add_parser("stamp", help="bind the green tree and its tier to a preflight stamp")
+    s.add_argument("--tier", choices=TIERS, help="raise the tier above the path-based floor")
     sub.add_parser("status", help="show green/stamp state for the worktree and HEAD")
     h = sub.add_parser("hook", help="entry point for hooks/hooks.json")
     h.add_argument("event", choices=sorted(HOOKS))
@@ -309,7 +471,8 @@ def main(argv=None):
     cfg = load_config(root)
     if cfg is None:
         die("no %s here; run /land-it:init" % CONFIG)
-    {"check": cmd_check, "stamp": cmd_stamp, "status": cmd_status}[a.cmd](root, cfg, a)
+    {"check": cmd_check, "risk": cmd_risk, "round": cmd_round, "findings": cmd_findings,
+     "stamp": cmd_stamp, "status": cmd_status}[a.cmd](root, cfg, a)
 
 
 if __name__ == "__main__":

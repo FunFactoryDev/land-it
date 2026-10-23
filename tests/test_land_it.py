@@ -151,5 +151,114 @@ class OnEdit(unittest.TestCase):
         self.assertIsNone(r.edit("notes.txt", "bad\n"), "glob doesn't match")
 
 
+
+def branch(r, name="feature"):
+    sh(r.root, "git", "checkout", "-qb", name)
+
+
+class Risk(unittest.TestCase):
+    def test_tiers(self):
+        cfg = {"risk": {"high": ["src/billing/**"], "low": ["src/gen/**", ".claude/land-it.json"]}}
+        cases = {"README.md": "low", "docs/a/b.txt": "low", "src/a.py": "medium", "CLAUDE.md": "medium",
+                 "src/billing/pay.py": "high", "src/gen/x.py": "low", ".github/workflows/ci.yml": "high",
+                 ".claude/land-it.json": "high"}
+        for path, tier in cases.items():
+            self.assertEqual(LI.file_tier(path, cfg), tier, path)
+        self.assertEqual(LI.classify([], cfg)[0], "low")
+        self.assertEqual(LI.classify(["README.md", "src/a.py"], cfg)[0], "medium")
+
+    def test_cli_counts_committed_uncommitted_and_untracked(self):
+        r = Repo(self, {})
+        branch(r)
+        r.write("docs/guide.md", "hi\n")
+        r.commit("docs")
+        self.assertEqual(json.loads(r.cli("risk").stdout)["tier"], "low")
+        r.write("src/new.py", "x = 1\n")
+        out = json.loads(r.cli("risk").stdout)
+        self.assertEqual(out["tier"], "medium")
+        self.assertEqual(set(out["files"]), {"docs/guide.md", "src/new.py"})
+
+
+class Rounds(unittest.TestCase):
+    def test_diff_only_after_first_round_and_cap(self):
+        r = Repo(self, {"max_rounds": 2})
+        branch(r)
+        first = json.loads(r.cli("round").stdout)
+        self.assertEqual((first["round"], first["target"], first["over_cap"]), (1, "", False))
+        self.assertTrue(json.loads(r.cli("round").stdout)["already_reviewed"], "same tree, same round")
+        r.write("a.py", "x = 'fixed'\n")
+        second = json.loads(r.cli("round").stdout)
+        self.assertEqual(second["round"], 2)
+        start, end = second["target"].split("..")
+        self.assertEqual(sh(r.root, "git", "diff", "--name-only", start, end).split(), ["a.py"])
+        r.write("a.py", "x = 'again'\n")
+        self.assertTrue(json.loads(r.cli("round").stdout)["over_cap"])
+        r.cli("round", "--reset")
+        self.assertEqual(json.loads(r.cli("round").stdout)["round"], 1)
+
+
+class Findings(unittest.TestCase):
+    def test_pre_existing_dedupe_and_every_finding_answered(self):
+        r = Repo(self, {"checks": {"ok": "true"}})
+        branch(r)
+        r.write("a.py", "x = 1\ny = 2\n")
+        r.commit("add y")
+        found = [{"file": "a.py", "line": 1, "summary": "x is wrong"},
+                 {"file": os.path.join(r.root, "a.py"), "line": "2", "summary": "y is wrong"}]
+        added = json.loads(r.cli("findings", "add", stdin=json.dumps(found)).stdout)
+        self.assertEqual([(f["id"], f["status"]) for f in added], [("F1", "pre-existing"), ("F2", "open")])
+        again = json.loads(r.cli("findings", "add", stdin=json.dumps(found[1:])).stdout)
+        self.assertEqual(again, [], "a finding is never posted twice")
+        r.cli("check")
+        refused = r.cli("stamp")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("F2", refused.stderr)
+        self.assertNotEqual(r.cli("findings", "resolve", "F2", "--status", "wontfix").returncode, 0, "needs a reason")
+        self.assertEqual(r.cli("findings", "resolve", "F2", "--status", "wontfix", "--reason", "intended").returncode, 0)
+        self.assertEqual(r.cli("stamp").returncode, 0)
+
+    def test_stamp_tier_can_rise_never_drop(self):
+        r = Repo(self, {"checks": {"ok": "true"}})
+        branch(r)
+        r.write(".github/workflows/ci.yml", "on: push\n")
+        r.cli("check")
+        self.assertNotEqual(r.cli("stamp", "--tier", "low").returncode, 0)
+        self.assertEqual(json.loads(r.cli("stamp", "--tier", "high").stdout)["tier"], "high")
+
+
+class MergeGate(unittest.TestCase):
+    def merge(self, r, cmd):
+        out = r.hook("pre-bash", tool_input={"command": cmd})
+        return out and out["hookSpecificOutput"]["permissionDecision"]
+
+    def test_only_low_stamped_head_merges_without_a_human(self):
+        r = Repo(self, {"checks": {"ok": "true"}})
+        branch(r)
+        r.write("docs/a.md", "x\n")
+        r.commit("docs")
+        r.cli("check")
+        r.cli("stamp")
+        self.assertIsNone(self.merge(r, "gh pr merge --squash --delete-branch"))
+        self.assertEqual(self.merge(r, "gh pr merge 12 --squash"), "ask", "another PR: can't vouch for it")
+        r.write("src/a.py", "x\n")
+        r.commit("code")
+        r.cli("check")
+        r.cli("stamp")
+        self.assertEqual(self.merge(r, "gh pr merge --squash"), "ask", "medium needs a person")
+
+    def test_agent_never_approves(self):
+        r = Repo(self, {})
+        self.assertEqual(self.merge(r, "gh pr review 5 --approve -b lgtm"), "deny")
+        self.assertIsNone(self.merge(r, "gh pr review 5 --comment -b 'see line 3'"))
+        self.assertIsNone(self.merge(r, "git status"))
+
+
+class StopLowTier(unittest.TestCase):
+    def test_docs_only_turn_skips_checks(self):
+        r = Repo(self, {"checks": {"t": "false"}})
+        r.edit("README.md", "words\n")
+        self.assertIsNone(r.hook("stop"))
+
+
 if __name__ == "__main__":
     unittest.main()

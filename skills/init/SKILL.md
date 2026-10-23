@@ -30,6 +30,12 @@ Package.swift / *.xcodeproj, Makefile, existing CI workflows) and write the conf
 - `stop_checks`: the subset the Stop hook runs when Claude ends a turn after edits. Drop slow suites
   (e2e, full builds) here; `preflight` always runs every check.
 - `stop_gate: false` turns the Stop hook off for this repo.
+- `risk`: globs per tier. Put the repo's real dangerous areas under `high` (auth, billing, payments,
+  migrations, installers, release scripts, anything an incident would start in) and generated code or
+  fixtures under `low`. Unlisted paths are medium; `*.md` and `docs/**` are low; CI workflows and this
+  config are always high. Start strict: it's easier to loosen a tier with evidence than to tighten one after an incident.
+- `max_rounds` (default 3): review rounds before preflight stops and asks to rethink the approach.
+- `base`: the branch PRs target, when it isn't `origin/HEAD`, `main` or `master`.
 
 Then run `land-it check` and show the output. A check that fails because the tool is missing or the
 command is wrong: fix the config. A check that fails on real problems in the code: keep it and tell the user;
