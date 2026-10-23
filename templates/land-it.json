@@ -1,0 +1,12 @@
+{
+  "checks": {
+    "lint": "npm run lint",
+    "typecheck": "npx tsc --noEmit",
+    "test": "npm test",
+    "build": "npm run build"
+  },
+  "on_edit": {
+    "*.{ts,tsx,js,jsx,css,json}": "npx prettier --write {file}"
+  },
+  "stop_checks": ["lint", "typecheck", "test"]
+}

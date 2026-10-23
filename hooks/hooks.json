@@ -1,0 +1,28 @@
+{
+  "description": "land-it: format/lint on edit, checks before Claude says done, preflight stamp before gh pr create. Silent in repos without .claude/land-it.json.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/land-it", "hook", "post-edit"], "timeout": 120 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/land-it", "hook", "stop"], "timeout": 900 }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/land-it", "hook", "pre-bash"], "timeout": 30 }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "land-it-marketplace",
+  "owner": { "name": "FunFactoryDev", "url": "https://github.com/FunFactoryDev" },
+  "description": "land-it: the pre-PR review pipeline from Anthropic's own code review process, as a Claude Code plugin",
+  "plugins": [
+    {
+      "name": "land-it",
+      "source": "./",
+      "description": "Pre-PR review pipeline: checks with evidence, review, security review, tree-bound stamp"
+    }
+  ]
+}

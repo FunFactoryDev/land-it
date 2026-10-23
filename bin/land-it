@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""land-it: the deterministic half of the pre-PR pipeline.
+
+Checks, the tree-bound stamp and the hooks live here; judgment (what to
+review, how to fix) lives in the skills. Stdlib only, Python 3.9+.
+"""
+import argparse
+import contextlib
+import functools
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+try:
+    import fcntl
+except ImportError:  # ponytail: no state lock on Windows; parallel hooks may drop a dirty mark
+    fcntl = None
+
+CONFIG = ".claude/land-it.json"
+TAIL = 4000  # chars of failing output handed back to Claude
+MAX_STOP_BLOCKS = 3
+DAY = 86400
+
+
+def die(msg):
+    sys.exit("land-it: " + msg)
+
+
+def git(root, *args, env=None, check=True):
+    r = subprocess.run(["git", *args], cwd=root, env=env, capture_output=True, text=True)
+    if check and r.returncode:
+        die("git %s: %s" % (" ".join(args), r.stderr.strip()))
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def find_root(cwd):
+    r = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd, capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def load_config(root):
+    path = os.path.join(root, CONFIG)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def tail(text, n=TAIL):
+    return text if len(text) <= n else "...\n" + text[-n:]
+
+
+# --- globs -----------------------------------------------------------------
+
+@functools.lru_cache(maxsize=None)
+def glob_re(pat):
+    """gitignore-ish: `*` stays in a segment, `**` spans, `{a,b}` alternates,
+    no slash means any depth, a match on a directory covers what's under it."""
+    if "/" not in pat:
+        pat = "**/" + pat
+    out, i, depth = "", 0, 0
+    while i < len(pat):
+        if pat.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+            continue
+        if pat.startswith("**", i):
+            out, i = out + ".*", i + 2
+            continue
+        c = pat[i]
+        if c == "*":
+            out += "[^/]*"
+        elif c == "?":
+            out += "[^/]"
+        elif c == "{":
+            out, depth = out + "(?:", depth + 1
+        elif c == "}" and depth:
+            out, depth = out + ")", depth - 1
+        elif c == "," and depth:
+            out += "|"
+        else:
+            out += re.escape(c)
+        i += 1
+    return re.compile(out + r"(?:/.*)?\Z")
+
+
+def matches(pat, path):
+    return bool(glob_re(pat.rstrip("/")).match(path))
+
+
+# --- state (per worktree, inside the git dir: never committed) ---------------
+
+def state_dir(root):
+    return os.path.join(git(root, "rev-parse", "--absolute-git-dir"), "land-it")
+
+
+def load_state(root):
+    try:
+        with open(os.path.join(state_dir(root), "state.json")) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+@contextlib.contextmanager
+def locked_state(root):
+    d = state_dir(root)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "lock"), "w") as lock:
+        if fcntl:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        st = load_state(root)
+        yield st
+        path = os.path.join(d, "state.json")
+        with open(path + ".tmp", "w") as f:
+            json.dump(st, f, indent=1)
+        os.replace(path + ".tmp", path)
+
+
+def worktree_tree(root):
+    """Tree hash of the working tree as it would be committed with `git add -A`."""
+    with tempfile.TemporaryDirectory() as d:
+        idx = os.path.join(d, "index")
+        src = os.path.join(git(root, "rev-parse", "--absolute-git-dir"), "index")
+        if os.path.exists(src):
+            # copy2 keeps the index mtime: git's racy-entry check depends on it, and a
+            # fresh mtime makes a same-size edit in the same second look unchanged
+            shutil.copy2(src, idx)
+        env = dict(os.environ, GIT_INDEX_FILE=idx)
+        git(root, "add", "-A", env=env)
+        return git(root, "write-tree", env=env)
+
+
+def head_tree(root):
+    return git(root, "rev-parse", "HEAD^{tree}", check=False)
+
+
+# --- checks ------------------------------------------------------------------
+
+def run_checks(root, cfg, only=None):
+    """Run configured checks in order, stop at the first failure. -> (ok, ran_all, log)"""
+    checks = cfg.get("checks") or {}
+    log, ran = [], 0
+    for name, cmd in checks.items():
+        if only is not None and name not in only:
+            continue
+        t = time.time()
+        r = subprocess.run(cmd, shell=True, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        verdict = "PASS" if r.returncode == 0 else "FAIL (exit %d)" % r.returncode
+        log.append("== %s: %s\n%s== %s: %s in %.1fs" % (name, cmd, r.stdout, name, verdict, time.time() - t))
+        ran += 1
+        if r.returncode:
+            return False, False, "\n".join(log)
+    if not checks:
+        log.append("== no checks configured in %s" % CONFIG)
+    return True, ran == len(checks), "\n".join(log)
+
+
+def cmd_check(root, cfg, a):
+    ok, ran_all, log = run_checks(root, cfg)
+    print(log)
+    if ok and ran_all:
+        tree = worktree_tree(root)
+        with locked_state(root) as st:
+            st["green"] = tree
+        print("== land-it: all checks green for tree %s" % tree[:12])
+    sys.exit(0 if ok else 1)
+
+
+def cmd_stamp(root, cfg, a):
+    tree = worktree_tree(root)
+    with locked_state(root) as st:
+        if st.get("green") != tree:
+            die("checks are not green for the current tree; run `land-it check` first")
+        st["stamp"] = {"tree": tree, "at": int(time.time())}
+    print(json.dumps({"stamped": tree, "pr_body": os.path.join(state_dir(root), "pr-body.md")}, indent=1))
+
+
+def cmd_status(root, cfg, a):
+    st, tree, head = load_state(root), worktree_tree(root), head_tree(root)
+    stamp = st.get("stamp") or {}
+    print(json.dumps({
+        "checks": list((cfg.get("checks") or {}).keys()),
+        "checks_green_for_worktree": st.get("green") == tree,
+        "stamp_matches_worktree": stamp.get("tree") == tree,
+        "stamp_matches_head": bool(head) and stamp.get("tree") == head,
+        "state_dir": state_dir(root),
+    }, indent=1))
+
+
+# --- hooks -------------------------------------------------------------------
+
+def emit(obj):
+    print(json.dumps(obj))
+    sys.exit(0)
+
+
+def hook_post_edit(data, root, cfg):
+    path = (data.get("tool_input") or {}).get("file_path")
+    if not path:
+        return
+    path = os.path.join(data.get("cwd") or root, path)
+    rel = os.path.relpath(os.path.realpath(path), os.path.realpath(root))
+    if rel.startswith(".."):
+        return
+    now = int(time.time())
+    with locked_state(root) as st:
+        dirty = st.setdefault("dirty", {})
+        for sid in [s for s, e in dirty.items() if now - e.get("at", 0) > 7 * DAY]:
+            del dirty[sid]
+        entry = dirty.setdefault(data.get("session_id", "?"), {"files": []})
+        entry["at"] = now
+        if rel not in entry["files"]:
+            entry["files"].append(rel)
+    problems = []
+    for pat, cmd in (cfg.get("on_edit") or {}).items():
+        if matches(pat, rel) and os.path.exists(path):
+            cmd = cmd.replace("{file}", shlex.quote(path))
+            r = subprocess.run(cmd, shell=True, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            if r.returncode:
+                problems.append("$ %s\n%s" % (cmd, tail(r.stdout, 1500)))
+    if problems:
+        emit({"decision": "block", "reason": "land-it on_edit failed for %s; fix it before moving on:\n\n%s"
+              % (rel, "\n\n".join(problems))})
+
+
+def hook_stop(data, root, cfg):
+    if cfg.get("stop_gate") is False:
+        return
+    sid = data.get("session_id", "?")
+    entry = (load_state(root).get("dirty") or {}).get(sid)
+    if not entry:
+        return
+    tree = worktree_tree(root)
+    if load_state(root).get("green") == tree or entry.get("red") == tree:
+        # green: nothing to prove. red on this exact tree: Claude already saw the
+        # failure and chose to stop (e.g. to ask the user); re-running changes nothing.
+        return
+    ok, ran_all, log = run_checks(root, cfg, cfg.get("stop_checks"))
+    with locked_state(root) as st:
+        dirty = st.setdefault("dirty", {})
+        if ok:
+            dirty.pop(sid, None)
+            if ran_all:
+                st["green"] = tree
+        else:
+            e = dirty.setdefault(sid, entry)
+            e["red"], e["blocks"] = tree, e.get("blocks", 0) + 1
+            blocks = e["blocks"]
+    if ok:
+        emit({"systemMessage": "land-it: checks green after this turn's edits"})
+    if blocks > MAX_STOP_BLOCKS:
+        emit({"systemMessage": "land-it: checks still red after %d tries; over to you.\n%s" % (MAX_STOP_BLOCKS, tail(log, 800))})
+    emit({"decision": "block", "reason":
+          "land-it: checks fail after your edits. Fix them, re-run, and show the output; "
+          "don't report done on a red tree. If you are deliberately pausing (to ask the user), "
+          "say so and stop again without changes.\n\n" + tail(log)})
+
+
+GH_PR_CREATE = re.compile(r"\bgh\s+pr\s+create\b")
+
+
+def deny(reason):
+    emit({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                 "permissionDecisionReason": reason}})
+
+
+def hook_pre_bash(data, root, cfg):
+    cmd = (data.get("tool_input") or {}).get("command") or ""
+    if GH_PR_CREATE.search(cmd):
+        stamp = load_state(root).get("stamp") or {}
+        if not stamp.get("tree") or stamp["tree"] != head_tree(root):
+            deny("land-it: HEAD has no preflight stamp, or it changed after the stamp. Run /land-it:preflight "
+                 "(the stamp covers exactly the tree it checked), commit everything it checked, then create the PR. "
+                 "To skip deliberately, the user can run the command themselves.")
+
+
+HOOKS = {"post-edit": hook_post_edit, "stop": hook_stop, "pre-bash": hook_pre_bash}
+
+
+def run_hook(event):
+    try:
+        data = json.load(sys.stdin)
+    except ValueError:
+        data = {}
+    root = find_root(data.get("cwd") or os.getcwd())
+    cfg = load_config(root) if root else None
+    if cfg is not None:  # no config = land-it isn't set up in this repo: stay silent
+        HOOKS[event](data, root, cfg)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="land-it", description=__doc__.splitlines()[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("check", help="run configured checks; on success mark the tree green")
+    sub.add_parser("stamp", help="bind the green tree to a preflight stamp (gates `gh pr create`)")
+    sub.add_parser("status", help="show green/stamp state for the worktree and HEAD")
+    h = sub.add_parser("hook", help="entry point for hooks/hooks.json")
+    h.add_argument("event", choices=sorted(HOOKS))
+    a = p.parse_args(argv)
+    if a.cmd == "hook":
+        return run_hook(a.event)
+    root = find_root(os.getcwd()) or die("not inside a git repository")
+    cfg = load_config(root)
+    if cfg is None:
+        die("no %s here; run /land-it:init" % CONFIG)
+    {"check": cmd_check, "stamp": cmd_stamp, "status": cmd_status}[a.cmd](root, cfg, a)
+
+
+if __name__ == "__main__":
+    main()
