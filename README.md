@@ -24,6 +24,7 @@ tune them, and the evidence that the change you open as a PR is the change that 
 | PR template: Testing, Risk, How to revert | init installs it; preflight fills it from real command output |
 | An approval covers one specific commit | **PreToolUse hook**: Claude's `gh pr create` is allowed only if HEAD's tree is exactly the tree preflight stamped |
 | AI review and security review on every PR, every thread resolved, stale approvals dismissed | `init --ci --protect`: GitHub workflow plus branch protection (asks before touching GitHub) |
+| Incidents become evals; a reviewer change is kept only if the score rises | **`/land-it:eval`**: record the commit behind a revert or incident as a case, run the reviewer on all cases with today's rules, get recall, noise and a keep/revert verdict |
 
 ## Install
 
@@ -44,6 +45,21 @@ Requirements: git, Python 3.9+, a recent Claude Code (tested on 2.1.300).
    `stop_checks` run, and red output goes back to Claude instead of a "done".
 2. Before the PR: `/land-it:preflight` (add `commit` to let it commit the stamped tree).
 3. `gh pr create --body-file <path preflight printed>`. If anything changed after the stamp, the hook says so.
+4. When something slips through (a revert, an incident): `/land-it:eval add <the fix or revert>`. Before and
+   after editing REVIEW.md or switching models: `/land-it:eval run`.
+
+## Evals
+
+A case is a past change with a confirmed bug (file, lines, one-line summary) or a known-good change. Cases live
+in `.land-it/evals/` and are committed. `land-it eval run` checks out each case in a throwaway worktree, copies in
+today's CLAUDE.md, REVIEW.md and land-it config, runs `claude -p "/code-review <effort> <range>"` and scores it:
+
+- **recall**: recorded bugs the review cited within 5 lines of the recorded location;
+- **noise**: findings per known-good case;
+- **verdict** against the previous full run: keep a change only if recall rises, or holds with less noise.
+
+Every case is a full review run, so it costs what a review costs. `--only` iterates on one case without
+recording; `--reviewer "<cmd with {range}>"` scores a different reviewer, such as your own skill.
 
 ## Configuration: `.claude/land-it.json`
 
@@ -65,6 +81,7 @@ Requirements: git, Python 3.9+, a recent Claude Code (tested on 2.1.300).
 | `stop_gate` | `false` turns the Stop hook off |
 | `risk` | `high` / `medium` / `low` globs. Unlisted paths are medium; `*.md`, `docs/**`, `LICENSE*` default to low; `CLAUDE.md`, `REVIEW.md`, `.claude/**` to medium; CI workflows, CODEOWNERS and this file are always high |
 | `max_rounds` | Review rounds before preflight stops and asks to rethink the approach (default 3) |
+| `review_effort` | `/code-review` effort per tier, the repo's Quick/Standard/Deep. Default `{"low": "low", "medium": "medium", "high": "high"}`. `max` is the deepest local pass, but it fans out to dozens of agents and can take most of an hour even on a small diff |
 | `base` | The branch PRs target, if not `origin/HEAD`, `main` or `master` |
 
 Globs follow gitignore rules: `*` stays inside a path segment, `**` crosses segments, `{a,b}` alternates,
@@ -83,6 +100,7 @@ The plugin puts `land-it` on Claude's PATH; the skills call it. You can call it 
 | `land-it findings [add \| resolve ID --status S --reason R]` | The branch's findings ledger; `add` takes JSON on stdin and tags pre-existing lines |
 | `land-it stamp [--tier T]` | Bind the green tree and its tier to a stamp; refuses on open findings or a tier below the path floor |
 | `land-it status` | Is the worktree green? Does the stamp match the worktree, and HEAD? |
+| `land-it eval [list \| add … \| run …]` | Reviewer evals: add a bug or clean case, run them, compare with the last run |
 
 State lives in the git dir (`.git/land-it/`), per worktree, never committed.
 
@@ -91,6 +109,16 @@ State lives in the git dir (`.git/land-it/`), per worktree, never committed.
 - The gates cover Claude's tool calls. You can still run `gh pr create` yourself; that's deliberate.
 - The Stop hook tracks files Claude edits with Edit/Write. Files changed only through Bash (`sed -i`) don't mark the session dirty.
 - No state lock on Windows (no `fcntl`): parallel hooks may drop a dirty mark.
+
+## По-русски
+
+land-it переносит процесс ревью команды Claude Code ([статья](https://claude.dev/blog/solving-code-review-at-anthropic/))
+в любой репозиторий. Хуки не дают Claude сказать «готово» на красных проверках и открыть PR с непроверенным кодом.
+`/land-it:preflight` прогоняет проверки, `/simplify`, `/code-review` и `/security-review` с глубиной по уровню риска
+и требует ответа на каждую находку. `/land-it:eval` превращает прошлые инциденты в тесты для ревьюера.
+Установка: команды из раздела Install, затем `/land-it:init` в своём проекте.
+
+Больше о Claude Code — бесплатный курс на [zero2claude.ru](https://zero2claude.ru).
 
 ## License
 

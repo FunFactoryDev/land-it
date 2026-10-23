@@ -179,6 +179,11 @@ class Risk(unittest.TestCase):
         self.assertEqual(set(out["files"]), {"docs/guide.md", "src/new.py"})
 
 
+    def test_review_effort_defaults_and_override(self):
+        r = Repo(self, {"review_effort": {"high": "max"}})
+        out = json.loads(r.cli("risk").stdout)["review_effort"]
+        self.assertEqual(out, {"low": "low", "medium": "medium", "high": "max"})
+
 class Rounds(unittest.TestCase):
     def test_diff_only_after_first_round_and_cap(self):
         r = Repo(self, {"max_rounds": 2})
@@ -258,6 +263,50 @@ class StopLowTier(unittest.TestCase):
         r = Repo(self, {"checks": {"t": "false"}})
         r.edit("README.md", "words\n")
         self.assertIsNone(r.hook("stop"))
+
+
+
+class Evals(unittest.TestCase):
+    def setUp(self):
+        self.r = r = Repo(self, {})
+        r.write("a.py", "x = 1\ny = None\nz = 3\n")
+        r.commit("bug lands on line 2")
+        self.bug = sh(r.root, "git", "rev-parse", "HEAD").strip()
+        r.write("b.py", "ok = True\n")
+        r.commit("clean change")
+        self.clean = sh(r.root, "git", "rev-parse", "HEAD").strip()
+        add = r.cli("eval", "add", "--commit", self.bug, "--file", "a.py", "--line", "2", "--summary", "y is None")
+        self.assertEqual(add.returncode, 0, add.stderr)
+        self.assertEqual(r.cli("eval", "add", "--commit", self.clean, "--clean", "--id", "clean1").returncode, 0)
+        r.write("REVIEW.md", "RULE-X\n")  # today's rules, uncommitted: the eval must use them
+
+    def stub(self, on_bug, on_clean="Nothing to fix."):
+        # a fake reviewer that only "sees" when the copied REVIEW.md is present
+        return ("grep -q RULE-X REVIEW.md || exit 3; case {range} in *%s) echo '%s';; *) echo '%s';; esac"
+                % (self.bug, on_bug, on_clean))
+
+    def run_eval(self, *args):
+        out = self.r.cli("eval", "run", *args)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout
+
+    def test_scores_and_verdicts(self):
+        self.assertIn("baseline recorded", self.run_eval("--reviewer", self.stub("Important: a.py:2 y is None")))
+        self.assertIn("no change", self.run_eval("--reviewer", self.stub("a.py:3 near the bug")))
+        self.assertIn("more noise", self.run_eval("--reviewer", self.stub("a.py:2", "b.py:1 looks odd")))
+        self.assertIn("worse", self.run_eval("--reviewer", self.stub("src/other.py:2")))
+        with open(os.path.join(self.r.root, LI.EVAL_DIR, "history.jsonl")) as f:
+            runs = [json.loads(ln) for ln in f]
+        self.assertEqual([(x["recall"], x["noise"]) for x in runs], [(1.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 0.0)])
+        self.assertEqual(sh(self.r.root, "git", "worktree", "list").count("\n"), 1, "eval worktrees cleaned up")
+
+    def test_only_is_not_recorded_and_errors_block_comparison(self):
+        self.assertIn("not recorded", self.run_eval("--reviewer", self.stub("a.py:2"), "--only", "clean1"))
+        self.assertFalse(os.path.exists(os.path.join(self.r.root, LI.EVAL_DIR, "history.jsonl")))
+        self.assertIn("failed to run", self.run_eval("--reviewer", "exit 1"))
+
+    def test_bug_case_needs_location(self):
+        self.assertNotEqual(self.r.cli("eval", "add", "--commit", self.bug).returncode, 0)
 
 
 if __name__ == "__main__":

@@ -39,14 +39,21 @@ unless the test is wrong, and then say so. Stop and ask after three failed attem
 
 | Tier | Simplify | Code review | Security review | Behavior check | Human |
 |---|---|---|---|---|---|
-| low | skip | `code-review` with `low <target>` | only if it touches input parsing, auth or secrets | skip | none once checks are green |
-| medium | yes | `high <target>` | yes | if runtime behavior changes | one person reads the PR |
-| high | yes | `max <target>` | yes | yes | a person reads every high-tier file; suggest the user run `/code-review ultra` (cloud, billed, they start it) |
+| low | skip | `code-review` with `<effort> <target>` | only if it touches input parsing, auth or secrets | skip | none once checks are green |
+| medium | yes | `<effort> <target>` | yes | if runtime behavior changes | one person reads the PR |
+| high | yes | `<effort> <target>` | yes | yes | a person reads every high-tier file |
 
-Run the reviews through the Skill tool (`simplify`, `code-review`, `security-review`, `verify`); after
-`simplify`, run `land-it check` again. `code-review` follows CLAUDE.md, which imports REVIEW.md. If a skill
-is unavailable, spawn a general-purpose subagent with only the diff and REVIEW.md, none of your reasoning,
-and ask it for findings with `file:line` evidence.
+`<effort>` is `review_effort[tier]` from `land-it risk` (default low / medium / high). Don't go above it on
+your own: `max` fans out to dozens of agents and takes the better part of an hour. For a high-tier change,
+tell the user that `/code-review max` locally or `/code-review ultra` in the cloud (billed; they start it)
+is available if one missed bug would cost more than that.
+
+Run the steps in this order, through the Skill tool: `simplify` (then `land-it check` again),
+`code-review`, `security-review`, `verify`. `code-review` follows CLAUDE.md, which imports REVIEW.md. If a skill
+is unavailable or fails (`security-review` needs `origin/HEAD`, so it fails in a repo without a remote), don't
+substitute your own read of the code: spawn a general-purpose subagent with only the diff (`git diff <merge base>`)
+and REVIEW.md, none of your reasoning, ask it for findings with `file:line` evidence, and say in the PR body
+which step ran this way.
 
 ## 5. Findings ledger: every finding gets an answer
 

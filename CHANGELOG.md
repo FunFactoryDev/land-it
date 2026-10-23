@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0
+
+- `/land-it:eval` and `land-it eval add|run|list`: past incidents become reviewer test cases (bug cases with
+  file, lines and summary; clean cases for noise). `run` reviews each case in a throwaway worktree under
+  today's CLAUDE.md / REVIEW.md / config, scores recall and noise, appends to `.land-it/evals/history.jsonl`,
+  and says whether to keep or revert the reviewer change. `--reviewer` scores any other reviewer command.
+- `review_effort` config: `/code-review` effort per tier, default low / medium / high. `max` is opt-in: in a
+  live run it fanned out to ~45 agents and 40+ minutes on a 6-line diff.
+- preflight: explicit step order (simplify before review); a failed review skill falls back to a fresh-context
+  subagent instead of Claude's own read, and the PR body says so.
+
 ## 0.2.0
 
 - Risk tiers: `land-it risk` classifies the change from its paths (CI, CODEOWNERS and the land-it config

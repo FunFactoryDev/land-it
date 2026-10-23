@@ -7,6 +7,7 @@ review, how to fix) lives in the skills. Stdlib only, Python 3.9+.
 import argparse
 import contextlib
 import functools
+import hashlib
 import json
 import os
 import re
@@ -146,6 +147,9 @@ TIERS = ["low", "medium", "high"]
 # Config can't lower these: CI and the gate's own config decide what every other change must pass.
 ALWAYS_HIGH = [".github/workflows/**", ".gitlab-ci.yml", "CODEOWNERS", CONFIG]
 DEFAULT_RISK = {"medium": ["CLAUDE.md", "REVIEW.md", ".claude/**"], "low": ["*.md", "docs/**", "LICENSE*"]}
+# /code-review effort per tier, the repo's Quick/Standard/Deep. `max` fans out to dozens of
+# agents (40+ minutes even on a tiny diff), so it's opt-in through `review_effort`.
+REVIEW_EFFORT = {"low": "low", "medium": "medium", "high": "high"}
 
 
 def file_tier(path, cfg):
@@ -182,7 +186,8 @@ def changed_files(root, cfg):
 
 def cmd_risk(root, cfg, a):
     tier, per = classify(changed_files(root, cfg), cfg)
-    print(json.dumps({"tier": tier, "files": per}, indent=1))
+    effort = dict(REVIEW_EFFORT, **(cfg.get("review_effort") or {}))
+    print(json.dumps({"tier": tier, "files": per, "review_effort": effort}, indent=1))
 
 
 # --- review rounds and findings, per branch -------------------------------------
@@ -326,6 +331,158 @@ def cmd_status(root, cfg, a):
     }, indent=1))
 
 
+# --- evals: past incidents become test cases for the reviewer ------------------------
+
+EVAL_DIR = ".land-it/evals"
+GUIDANCE = ["CLAUDE.md", "REVIEW.md", CONFIG]  # what a reviewer change usually edits
+READ_ONLY_TOOLS = "Read,Grep,Glob,Agent,Bash(git diff *),Bash(git log *),Bash(git show *),Bash(git blame *)"
+LOC = re.compile(r"([\w@+-][\w./@+-]*\.\w+):(\d+)")
+
+
+def eval_cases(root):
+    d = os.path.join(root, EVAL_DIR)
+    cases = []
+    for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        if name.endswith(".json"):
+            with open(os.path.join(d, name)) as f:
+                cases.append(json.load(f))
+    return cases
+
+
+def eval_add(root, cfg, a):
+    if not (a.range or a.commit):
+        die("eval add needs --commit SHA or --range A..B")
+    if not a.clean and not (a.file and a.line and a.summary):
+        die("a bug case needs --file, --line (N or N-M) and --summary; --clean marks a known-good change")
+    start, _, end = (a.range or "%s^..%s" % (a.commit, a.commit)).partition("..")
+    rng = "%s..%s" % (git(root, "rev-parse", start), git(root, "rev-parse", end))
+    cid = a.id or rng[-40:][:10]
+    path = os.path.join(root, EVAL_DIR, cid + ".json")
+    case = {"id": cid, "range": rng, "kind": "clean" if a.clean else "bug", "expect": [],
+            "note": a.note or "", "added": time.strftime("%Y-%m-%d")}
+    if os.path.exists(path):
+        with open(path) as f:
+            case = json.load(f)
+        if case["range"] != rng or case["kind"] != ("clean" if a.clean else "bug"):
+            die("case %s already exists for another range or kind; pass --id" % cid)
+    if not a.clean:
+        lo, _, hi = a.line.partition("-")
+        case["expect"].append({"file": a.file, "lines": [int(lo), int(hi or lo)], "summary": a.summary})
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(case, f, indent=1)
+    print(json.dumps(case, indent=1))
+
+
+def run_reviewer(wt, rng, a):
+    if a.reviewer:
+        cmd, shell = a.reviewer.replace("{range}", shlex.quote(rng)).replace("{effort}", a.effort), True
+    else:
+        cmd, shell = ["claude", "-p", "/code-review %s %s" % (a.effort, rng), "--output-format", "text"], False
+        cmd += (["--model", a.model] if a.model else []) + ["--allowedTools", READ_ONLY_TOOLS]
+    try:
+        r = subprocess.run(cmd, shell=shell, cwd=wt, capture_output=True, text=True, timeout=a.timeout)
+    except subprocess.TimeoutExpired:
+        return 124, "timed out after %ds" % a.timeout
+    return r.returncode, r.stdout + ("\n" + r.stderr if r.returncode else "")
+
+
+def same_file(x, y):
+    x, y = x.removeprefix("./"), y.removeprefix("./")
+    return x == y or x.endswith("/" + y) or y.endswith("/" + x)
+
+
+def score(case, text, slack=5):
+    # ponytail: a finding is any `file:line` the review cites, so context citations count as noise;
+    # switch to a structured findings format if the noise number starts to mislead
+    found = sorted({(m.group(1), int(m.group(2))) for m in LOC.finditer(text)})
+    res = {"id": case["id"], "kind": case["kind"], "findings": len(found)}
+    if case["kind"] == "bug":
+        res["expected"] = len(case["expect"])
+        res["caught"] = sum(any(same_file(f, e["file"]) and e["lines"][0] - slack <= n <= e["lines"][1] + slack
+                                for f, n in found) for e in case["expect"])
+    return res
+
+
+def verdict(cur, prev):
+    if cur["errors"]:
+        return "%d case(s) failed to run; fix that before comparing" % cur["errors"]
+    if not prev:
+        return "baseline recorded"
+    if sorted(prev["case_ids"]) != sorted(cur["case_ids"]) or prev["errors"]:
+        return "case set changed: new baseline, compare from the next run"
+    r0, r1, n0, n1 = prev["recall"] or 0, cur["recall"] or 0, prev["noise"] or 0, cur["noise"] or 0
+    if r1 != r0:
+        return ("better: recall %.0f%% -> %.0f%%, keep the change" if r1 > r0 else
+                "worse: recall %.0f%% -> %.0f%%, revert the reviewer change") % (r0 * 100, r1 * 100)
+    if n1 != n0:
+        return ("same recall, less noise (%.2f -> %.2f): keep the change" if n1 < n0 else
+                "same recall, more noise (%.2f -> %.2f): revert unless the extra findings are real") % (n0, n1)
+    return "no change"
+
+
+def eval_run(root, cfg, a):
+    cases = [c for c in eval_cases(root) if not a.only or c["id"] in a.only]
+    if not cases:
+        die("no eval cases in %s; add one with `land-it eval add`" % EVAL_DIR)
+    results = []
+    for c in cases:
+        tmp = tempfile.mkdtemp(prefix="land-it-eval-")
+        wt = os.path.join(tmp, "wt")
+        git(root, "worktree", "add", "--detach", "--quiet", wt, c["range"].split("..")[1])
+        try:
+            for rel in GUIDANCE:  # the old change, reviewed under today's rules: that's what is being tested
+                if os.path.exists(os.path.join(root, rel)):
+                    os.makedirs(os.path.dirname(os.path.join(wt, rel)) or wt, exist_ok=True)
+                    shutil.copy2(os.path.join(root, rel), os.path.join(wt, rel))
+            code, text = run_reviewer(wt, c["range"], a)
+        finally:
+            git(root, "worktree", "remove", "--force", wt, check=False)
+            shutil.rmtree(tmp, ignore_errors=True)
+        res = score(c, text) if code == 0 else {"id": c["id"], "kind": c["kind"], "error": tail(text, 300)}
+        results.append(res)
+        print("%-14s %-5s %s" % (c["id"], c["kind"], res.get("error") or
+              ("caught %d/%d, " % (res["caught"], res["expected"]) if c["kind"] == "bug" else "") +
+              "%d finding(s)" % res["findings"]), flush=True)
+    bugs = [r for r in results if r["kind"] == "bug" and "error" not in r]
+    clean = [r for r in results if r["kind"] == "clean" and "error" not in r]
+    expected = sum(r["expected"] for r in bugs)
+    digest = hashlib.sha1()
+    for rel in GUIDANCE:
+        if os.path.exists(os.path.join(root, rel)):
+            with open(os.path.join(root, rel), "rb") as f:
+                digest.update(rel.encode() + b"\0" + f.read())
+    run = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "model": a.model or "default", "effort": a.effort,
+           "reviewer": a.reviewer or "code-review", "guidance": digest.hexdigest()[:12],
+           "case_ids": [c["id"] for c in cases], "errors": sum("error" in r for r in results),
+           "recall": round(sum(r["caught"] for r in bugs) / expected, 3) if expected else None,
+           "noise": round(sum(r["findings"] for r in clean) / len(clean), 2) if clean else None,
+           "cases": results}
+    summary = {k: run[k] for k in ("recall", "noise", "errors", "guidance")}
+    if a.only:
+        print(json.dumps(summary), "\npartial run (--only): not recorded in history")
+        return
+    hist = os.path.join(root, EVAL_DIR, "history.jsonl")
+    prev = None
+    if os.path.exists(hist):
+        with open(hist) as f:
+            lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        prev = json.loads(lines[-1]) if lines else None
+    with open(hist, "a") as f:
+        f.write(json.dumps(run) + "\n")
+    print(json.dumps(summary), "\nverdict:", verdict(run, prev))
+
+
+def eval_list(root, cfg, a):
+    for c in eval_cases(root):
+        print("%-14s %-5s %s  %s" % (c["id"], c["kind"], c["range"][:7] + ".." + c["range"][-40:][:7],
+                                     "; ".join("%s:%d %s" % (e["file"], e["lines"][0], e["summary"]) for e in c["expect"])))
+
+
+def cmd_eval(root, cfg, a):
+    {"add": eval_add, "run": eval_run, "list": eval_list}[a.action](root, cfg, a)
+
+
 # --- hooks -------------------------------------------------------------------
 
 def emit(obj):
@@ -462,6 +619,22 @@ def main(argv=None):
     s = sub.add_parser("stamp", help="bind the green tree and its tier to a preflight stamp")
     s.add_argument("--tier", choices=TIERS, help="raise the tier above the path-based floor")
     sub.add_parser("status", help="show green/stamp state for the worktree and HEAD")
+    e = sub.add_parser("eval", help="reviewer evals from past incidents: list, add, run")
+    e.add_argument("action", nargs="?", default="list", choices=["list", "add", "run"])
+    e.add_argument("--commit", help="add: the commit that introduced the bug (reviewed as SHA^..SHA)")
+    e.add_argument("--range", help="add: A..B, for a change spanning several commits")
+    e.add_argument("--clean", action="store_true", help="add: a known-good change, for measuring noise")
+    e.add_argument("--file")
+    e.add_argument("--line", help="N or N-M")
+    e.add_argument("--summary")
+    e.add_argument("--note")
+    e.add_argument("--id")
+    e.add_argument("--only", nargs="+", help="run: these case ids (not recorded in history)")
+    e.add_argument("--model")
+    e.add_argument("--effort", default="high")
+    e.add_argument("--reviewer", help="run: shell command instead of `claude -p /code-review`; "
+                                      "{range} and {effort} are substituted")
+    e.add_argument("--timeout", type=int, default=1800)
     h = sub.add_parser("hook", help="entry point for hooks/hooks.json")
     h.add_argument("event", choices=sorted(HOOKS))
     a = p.parse_args(argv)
@@ -472,7 +645,7 @@ def main(argv=None):
     if cfg is None:
         die("no %s here; run /land-it:init" % CONFIG)
     {"check": cmd_check, "risk": cmd_risk, "round": cmd_round, "findings": cmd_findings,
-     "stamp": cmd_stamp, "status": cmd_status}[a.cmd](root, cfg, a)
+     "stamp": cmd_stamp, "status": cmd_status, "eval": cmd_eval}[a.cmd](root, cfg, a)
 
 
 if __name__ == "__main__":

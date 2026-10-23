@@ -35,6 +35,8 @@ Package.swift / *.xcodeproj, Makefile, existing CI workflows) and write the conf
   fixtures under `low`. Unlisted paths are medium; `*.md` and `docs/**` are low; CI workflows and this
   config are always high. Start strict: it's easier to loosen a tier with evidence than to tighten one after an incident.
 - `max_rounds` (default 3): review rounds before preflight stops and asks to rethink the approach.
+- `review_effort`: `/code-review` effort per tier (default low/medium/high). Raise `high` to `xhigh` or `max`
+  only for a repo where one missed bug costs more than a long, expensive review.
 - `base`: the branch PRs target, when it isn't `origin/HEAD`, `main` or `master`.
 
 Then run `land-it check` and show the output. A check that fails because the tool is missing or the
