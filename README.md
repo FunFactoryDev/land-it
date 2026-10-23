@@ -108,7 +108,9 @@ State lives in the git dir (`.git/land-it/`), per worktree, never committed.
 
 - The gates cover Claude's tool calls. You can still run `gh pr create` yourself; that's deliberate.
 - The Stop hook tracks files Claude edits with Edit/Write. Files changed only through Bash (`sed -i`) don't mark the session dirty.
-- No state lock on Windows (no `fcntl`): parallel hooks may drop a dirty mark.
+- Tested on macOS. Windows is untested: hooks call `python3`, and there's no state lock (no `fcntl`), so
+  parallel hooks may drop a dirty mark.
+- Eval recall counts any `file:line` the review cites near the recorded bug; noise counts every cited location.
 
 ## По-русски
 
