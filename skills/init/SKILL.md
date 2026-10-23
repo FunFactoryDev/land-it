@@ -38,6 +38,8 @@ Package.swift / *.xcodeproj, Makefile, existing CI workflows) and write the conf
 - `review_effort`: `/code-review` effort per tier (default low/medium/high). Raise `high` to `xhigh` or `max`
   only for a repo where one missed bug costs more than a long, expensive review.
 - `base`: the branch PRs target, when it isn't `origin/HEAD`, `main` or `master`.
+- `circuit_breaker` (on by default: `{"revert_rate": 0.05, "days": 14, "min_commits": 20}`): while reverts on
+  the base branch are above the rate, every change's floor is one tier higher. `false` turns it off.
 
 - A check may be `{"run": "...", "paths": ["web/**"]}`: it runs only when the change touches those paths.
   Use it in monorepos so a change in one package doesn't wait on every package's suite.

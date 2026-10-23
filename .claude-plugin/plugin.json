@@ -1,6 +1,6 @@
 {
   "name": "land-it",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "You land it, you own it. Pre-PR pipeline for Claude Code after Anthropic's own review process: checks with evidence, fresh-context review, security review, a stamp bound to the exact tree that was checked.",
   "author": {
     "name": "xpressmike"

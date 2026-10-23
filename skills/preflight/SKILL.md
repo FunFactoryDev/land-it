@@ -18,7 +18,8 @@ finding counts, the commands. "Tests pass" without output is not a step done.
 `land-it risk` gives the floor from the changed paths. Read the diff and **raise** the tier (never lower it)
 when the content is riskier than its path: auth, permissions, billing, data migrations or deletes, concurrency,
 crypto, secrets, public API contracts, installers and auto-updaters, system prompts → high. Tell the user
-the tier and the reason in one line.
+the tier and the reason in one line. If `circuit_breaker.tripped` is true, the floor is already one tier
+higher because reverts on the base branch are above the threshold: say so, with the numbers.
 
 ## 2. Review round
 

@@ -82,6 +82,9 @@ flowchart TD
 | PR template: Testing, Risk, How to revert | init installs it; preflight fills it from real command output |
 | AI review and security review on every PR; all threads resolved; stale approvals dismissed | `init --ci --protect`: a GitHub workflow and branch protection, applied only after you confirm |
 | Incidents become evals; a reviewer change is kept only if the score rises | **`/land-it:eval`**: the commit behind a revert becomes a case; `run` scores recall and noise and says keep or revert |
+| Track human time (approvals per PR, median and p95; human comments; wait time) with reverts and incidents as the guardrail | **`/land-it:stats`**: one-round passes, mean rounds, finding outcomes, the revert rate on the base branch; with `--github`, approvals and human comments per PR and hours to merge, bots excluded |
+| The article's open gap: no circuit breaker yet that tightens approval when reverts move | **Circuit breaker**: while reverts on the base branch are above the threshold, every change's risk floor rises one tier |
+| Measure noise: sort comments by response, run the reviewer on known-clean PRs | `wontfix_pct` in stats; clean eval cases; `--judge` scores the defect with an LLM judge instead of matching a citation |
 
 ## Install
 
@@ -106,6 +109,7 @@ Requirements: git, Python 3.9+ (stdlib only, nothing to install), a recent Claud
 3. **Open it:** `gh pr create --body-file <path preflight printed>`. If anything changed after the stamp, the hook says so.
 4. **When something slips through** (a revert, an incident): `/land-it:eval add <the fix or revert>`. Before and
    after you edit REVIEW.md or switch models: `/land-it:eval run`.
+5. **Now and then:** `/land-it:stats`, to see whether review gets faster without more reverts.
 
 ## Commands
 
@@ -115,6 +119,7 @@ Requirements: git, Python 3.9+ (stdlib only, nothing to install), a recent Claud
 | `/land-it:preflight` | The pre-PR pipeline: risk tier → review round → checks → simplify → code review → security review → behavior check → findings ledger → stamp → PR body |
 | `/land-it:eval` | `add`: record the commit behind an incident as a case. `run`: review every case under today's rules, score recall and noise, compare with the last run. `list` |
 | `/land-it:trust` | Approve the config's commands. Only a command you type counts; Claude can't invoke it |
+| `/land-it:stats` | The article's numbers for this repo, read against its goal: less human time, no more reverts. `--github` adds human time per PR |
 
 ### Review depth by tier
 
@@ -163,6 +168,7 @@ Requirements: git, Python 3.9+ (stdlib only, nothing to install), a recent Claud
 | `max_rounds` | Review rounds before preflight stops and asks to rethink the approach (default 3) |
 | `review_effort` | `/code-review` effort per tier. `max` is the deepest local pass, but it fans out to dozens of agents and can take most of an hour even on a small diff |
 | `base` | The branch PRs target, if it isn't `origin/HEAD`, `main` or `master` |
+| `circuit_breaker` | On by default: `{"revert_rate": 0.05, "days": 14, "min_commits": 20}`. While reverts among first-parent commits on the base branch are above the rate, every change's floor is one tier higher. `false` turns it off |
 
 Globs follow gitignore rules: `*` stays inside a path segment, `**` crosses segments, `{a,b}` alternates, a pattern
 without `/` matches at any depth, and a directory pattern covers everything under it.
@@ -190,7 +196,7 @@ each case in a throwaway worktree, copies in today's CLAUDE.md, REVIEW.md and la
 - **noise**: findings per known-good case;
 - **verdict** against the previous full run: keep a change only if recall rises, or holds with less noise.
 
-`--only` iterates on one case without recording. `--reviewer "<cmd with {range}>"` scores another reviewer, such as
+`--judge haiku` swaps the citation match for an LLM judge that reads each review and decides whether the recorded defect is reported, even if it's worded differently or cited elsewhere; it's more accurate for one small extra call per case, and runs with different scorers aren't compared. `--only` iterates on one case without recording. `--reviewer "<cmd with {range}>"` scores another reviewer, such as
 your own skill. `--model` and `--effort` compare models and depths.
 
 ## Cost in tokens and time
@@ -228,6 +234,7 @@ The plugin puts `land-it` on Claude's PATH; the skills call it. You can call it 
 | `land-it status` | Trust, green and stamp state for the worktree and HEAD |
 | `land-it trust` | Approve the config's commands, at your own terminal |
 | `land-it eval [list \| add … \| run …]` | Reviewer evals |
+| `land-it stats [--days N] [--github]` | One-round passes, rounds, finding outcomes, reverts, the circuit breaker; GitHub human time |
 
 ## What lives where
 
@@ -237,6 +244,7 @@ The plugin puts `land-it` on Claude's PATH; the skills call it. You can call it 
 | `REVIEW.md`, `.github/pull_request_template.md` | yes | Review rules, PR template |
 | `.land-it/evals/` | yes | Eval cases and `history.jsonl` |
 | `.git/land-it/` | no | Per-worktree state: green tree, stamp, turn snapshots, per-branch rounds and findings |
+| `.git/land-it/runs.jsonl` | no | One line per stamp, shared by all worktrees; `stats` reads it |
 | `~/.land-it/trust.json` | no | Your trust pins, per repository |
 
 ## Limitations

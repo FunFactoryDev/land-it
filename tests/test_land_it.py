@@ -3,6 +3,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -49,8 +50,8 @@ class Repo:
         sh(self.root, "git", "add", "-A")
         sh(self.root, "git", "commit", "-qm", msg)
 
-    def cli(self, *args, stdin=""):
-        env = dict(os.environ, LAND_IT_HOME=self._home.name)
+    def cli(self, *args, stdin="", env=None):
+        env = dict(os.environ, LAND_IT_HOME=self._home.name, **(env or {}))
         return subprocess.run([sys.executable, BIN, *args], cwd=self.root, input=stdin, capture_output=True, text=True,
                               env=env)
 
@@ -313,6 +314,16 @@ class Evals(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.r.root, LI.EVAL_DIR, "history.jsonl")))
         self.assertIn("failed to run", self.run_eval("--reviewer", "exit 1"))
 
+    def test_judge_scores_the_defect_not_the_citation(self):
+        reviewer = self.stub("the y default is wrong (no file:line given)")
+        judge = ("grep -q 'known-good' && echo '{\"caught\": 0, \"findings\": 2}' "
+                 "|| echo 'verdict: {\"caught\": 1, \"findings\": 1}'")
+        out = self.run_eval("--reviewer", reviewer, "--judge-cmd", judge)
+        self.assertIn('"recall": 1.0', out)
+        self.assertIn('"noise": 2.0', out)
+        self.assertIn("scorer changed", self.run_eval("--reviewer", reviewer))
+        self.assertIn("failed to run", self.run_eval("--reviewer", reviewer, "--judge-cmd", "echo no json"))
+
     def test_bug_case_needs_location(self):
         self.assertNotEqual(self.r.cli("eval", "add", "--commit", self.bug).returncode, 0)
 
@@ -376,6 +387,80 @@ class Turns(unittest.TestCase):
         self.assertIn("green", r.hook("stop")["systemMessage"])
         r.write("web/app.js", "x\n")
         self.assertEqual(r.cli("check").returncode, 1)
+
+
+
+class Measure(unittest.TestCase):
+    def commits_on_main(self, r, n, reverts):
+        for i in range(n):
+            msg = 'Revert "change %d"' % i if i < reverts else "change %d" % i
+            sh(r.root, "git", "commit", "-q", "--allow-empty", "-m", msg)
+
+    def test_circuit_breaker_raises_the_floor(self):
+        r = Repo(self, {"checks": {"ok": "true"}})
+        self.commits_on_main(r, 20, reverts=2)  # 2 of 21 > 5%
+        branch(r)
+        r.write("docs/a.md", "x\n")
+        out = json.loads(r.cli("risk").stdout)
+        self.assertTrue(out["circuit_breaker"]["tripped"])
+        self.assertEqual(out["tier"], "medium", "docs are low, the breaker lifts them one tier")
+        r.cli("check")
+        self.assertNotEqual(r.cli("stamp", "--tier", "low").returncode, 0)
+        r.write(".claude/land-it.json", json.dumps({"checks": {"ok": "true"}, "circuit_breaker": False}))
+        self.assertEqual(json.loads(r.cli("risk").stdout)["tier"], "high", "now the config itself changed")
+
+    def test_breaker_needs_enough_history(self):
+        r = Repo(self, {})
+        self.commits_on_main(r, 3, reverts=2)
+        self.assertFalse(json.loads(r.cli("risk").stdout)["circuit_breaker"]["tripped"])
+
+    def test_stats_from_stamps(self):
+        r = Repo(self, {"checks": {"ok": "true"}})
+        branch(r, "one")
+        r.write("src/a.py", "a\n")
+        r.cli("round")
+        r.cli("findings", "add", stdin=json.dumps([{"file": "src/a.py", "line": 1, "summary": "bug"}]))
+        r.cli("findings", "resolve", "F1", "--status", "fixed")
+        r.cli("check")
+        self.assertEqual(r.cli("stamp").returncode, 0)
+        r.cli("stamp")  # a re-stamp of the same change counts once
+        r.commit("one")
+        branch(r, "two")
+        r.write("src/b.py", "b\n")
+        r.cli("round")
+        r.write("src/b.py", "b2\n")
+        r.cli("round")
+        r.cli("check")
+        r.cli("stamp")
+        out = json.loads(r.cli("stats").stdout)
+        self.assertEqual(out["preflight"]["changes"], 2)
+        self.assertEqual(out["preflight"]["one_round_pct"], 50)
+        self.assertEqual(out["preflight"]["mean_rounds"], 1.5)
+        self.assertEqual((out["findings"]["total"], out["findings"]["fixed_pct"]), (1, 100))
+
+    def test_github_human_time(self):
+        r = Repo(self, {})
+        bot, human = lambda login: {"__typename": "Bot", "login": login}, lambda login: {"__typename": "User", "login": login}
+        prs = [{"title": "Add x", "createdAt": "2026-10-01T10:00:00Z", "mergedAt": "2026-10-01T12:00:00Z",
+                "reviews": {"nodes": [{"author": human("alice"), "state": "APPROVED", "body": ""},
+                                      {"author": bot("claude"), "state": "APPROVED", "body": "lgtm"}]},
+                "comments": {"nodes": [{"author": human("bob")}, {"author": bot("claude")}]}},
+               {"title": 'Revert "Add x"', "createdAt": "2026-10-02T00:00:00Z", "mergedAt": "2026-10-02T10:00:00Z",
+                "reviews": {"nodes": [{"author": bot("claude"), "state": "APPROVED", "body": "ok"}]},
+                "comments": {"nodes": []}}]
+        fake = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, fake)
+        with open(os.path.join(fake, "prs.json"), "w") as f:
+            f.write("\n".join(json.dumps(pr) for pr in prs))  # what `gh api --jq '.nodes[]'` prints
+        with open(os.path.join(fake, "gh"), "w") as f:
+            f.write("#!/bin/sh\ncat '%s/prs.json'\n" % fake)
+        os.chmod(os.path.join(fake, "gh"), 0o755)
+        gh = json.loads(r.cli("stats", "--github", env={"PATH": fake + os.pathsep + os.environ["PATH"]}).stdout)["github"]
+        self.assertEqual(gh["merged_prs"], 2)
+        self.assertEqual(gh["merged_without_approval_pct"], 50, "the Claude app's approval doesn't count")
+        self.assertEqual(gh["human_comments_per_pr"]["p95"], 1)
+        self.assertEqual(gh["revert_prs_pct"], 50)
+        self.assertEqual(gh["hours_to_merge"]["median"], 10.0)
 
 
 if __name__ == "__main__":

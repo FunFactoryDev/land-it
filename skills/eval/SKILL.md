@@ -41,6 +41,9 @@ land-it eval run [--model M] [--effort low|medium|high|xhigh|max] [--only ID ...
 
 - **recall**: share of recorded bugs the review cited within 5 lines of the recorded location.
 - **noise**: findings per known-good case.
+- `--judge haiku` scores with an LLM judge instead: it reads each review and decides whether the recorded defect
+  is reported (worded differently or cited elsewhere still counts) and how many distinct findings there are.
+  It costs one small extra call per case and is more accurate; runs with different scorers aren't compared.
 - The **verdict** compares with the previous full run: keep a reviewer change only when recall rises, or recall
   holds and noise drops. Revert it otherwise. Priority is catching real bugs first, fewer review rounds second.
 - `--only` runs a subset for iterating and isn't recorded. A run where a case failed isn't compared.

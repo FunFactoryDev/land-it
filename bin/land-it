@@ -6,6 +6,7 @@ review, how to fix) lives in the skills. Stdlib only, Python 3.9+.
 """
 import argparse
 import contextlib
+import datetime
 import functools
 import hashlib
 import json
@@ -217,11 +218,47 @@ def classify(files, cfg):
     return max(per.values(), key=TIERS.index, default="low"), per
 
 
-def merge_base(root, cfg):
+def base_ref(root, cfg):
     base = cfg.get("base") or git(root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
-    if not base:
-        base = next((b for b in ("main", "master") if git(root, "rev-parse", "--verify", "--quiet", b, check=False)), "")
+    return base or next((b for b in ("main", "master") if git(root, "rev-parse", "--verify", "--quiet", b, check=False)), "")
+
+
+def merge_base(root, cfg):
+    base = base_ref(root, cfg)
     return git(root, "merge-base", "HEAD", base, check=False) if base else ""
+
+
+REVERT = re.compile(r'^Revert "|This reverts commit [0-9a-f]{7,}', re.M)
+BREAKER = {"revert_rate": 0.05, "days": 14, "min_commits": 20}
+
+
+def revert_rate(root, cfg, days):
+    """Reverts among first-parent commits on the base branch: one unit per merged change."""
+    base = base_ref(root, cfg)
+    out = git(root, "log", "--first-parent", "--since=%d.days" % days, "--format=%B%x1e", base, check=False) if base else ""
+    msgs = [m for m in out.split("\x1e") if m.strip()]
+    reverts = sum(bool(REVERT.search(m)) for m in msgs)
+    return {"commits": len(msgs), "reverts": reverts, "rate": round(reverts / len(msgs), 3) if msgs else None}
+
+
+def breaker(root, cfg):
+    """The article's open gap: tighten review when reverts rise. Raises the floor one tier while tripped."""
+    conf = cfg.get("circuit_breaker")
+    if conf is False:
+        return None
+    conf = dict(BREAKER, **(conf or {}))
+    r = revert_rate(root, cfg, conf["days"])
+    r.update(days=conf["days"], threshold=conf["revert_rate"],
+             tripped=r["commits"] >= conf["min_commits"] and (r["rate"] or 0) > conf["revert_rate"])
+    return r
+
+
+def floor_tier(root, cfg):
+    tier, per = classify(changed_files(root, cfg), cfg)
+    b = breaker(root, cfg)
+    if b and b["tripped"] and per:
+        tier = TIERS[min(TIERS.index(tier) + 1, len(TIERS) - 1)]
+    return tier, per, b
 
 
 def changed_files(root, cfg):
@@ -232,9 +269,9 @@ def changed_files(root, cfg):
 
 
 def cmd_risk(root, cfg, a):
-    tier, per = classify(changed_files(root, cfg), cfg)
+    tier, per, b = floor_tier(root, cfg)
     effort = dict(REVIEW_EFFORT, **(cfg.get("review_effort") or {}))
-    print(json.dumps({"tier": tier, "files": per, "review_effort": effort}, indent=1))
+    print(json.dumps({"tier": tier, "files": per, "review_effort": effort, "circuit_breaker": b}, indent=1))
 
 
 # --- review rounds and findings, per branch -------------------------------------
@@ -364,19 +401,129 @@ def cmd_check(root, cfg, a):
 
 
 def cmd_stamp(root, cfg, a):
-    tree = worktree_tree(root)
-    floor, _ = classify(changed_files(root, cfg), cfg)
+    tree, now = worktree_tree(root), int(time.time())
+    floor, _, b = floor_tier(root, cfg)
     tier = a.tier or floor
     if TIERS.index(tier) < TIERS.index(floor):
-        die("tier %s is below %s from the changed paths: a tier can be raised, never lowered" % (tier, floor))
-    unanswered = [x["id"] for x in load_state(root, ledger_name(root)).get("findings", []) if x["status"] == "open"]
+        die("tier %s is below %s from the changed paths%s: a tier can be raised, never lowered"
+            % (tier, floor, " and the tripped circuit breaker" if b and b["tripped"] else ""))
+    led = load_state(root, ledger_name(root))
+    fs, rounds = led.get("findings", []), led.get("rounds", [])
+    unanswered = [x["id"] for x in fs if x["status"] == "open"]
     if unanswered:
         die("unanswered findings %s: resolve each one (fixed, or wontfix --reason)" % ", ".join(unanswered))
     with locked_state(root) as st:
         if st.get("green") != tree:
             die("checks are not green for the current tree; run `land-it check` first")
-        st["stamp"] = {"tree": tree, "tier": tier, "at": int(time.time())}
+        st["stamp"] = {"tree": tree, "tier": tier, "at": now}
+    record_run(root, {
+        "at": now, "branch": git(root, "rev-parse", "--abbrev-ref", "HEAD", check=False), "tier": tier,
+        "rounds": len(rounds), "minutes": round((now - rounds[0]["at"]) / 60, 1) if rounds else None,
+        "findings": {s: sum(x["status"] == s for x in fs) for s in ("fixed", "wontfix", "pre-existing")},
+        "breaker": bool(b and b["tripped"]),
+    })
     print(json.dumps({"stamped": tree, "tier": tier, "pr_body": os.path.join(state_dir(root), "pr-body.md")}, indent=1))
+
+
+# --- stats: the article's numbers for this repo ----------------------------------------
+
+def runs_path(root):
+    common = git(root, "rev-parse", "--git-common-dir")
+    return os.path.join(root if not os.path.isabs(common) else "", common, "land-it", "runs.jsonl")
+
+
+def record_run(root, rec):
+    """One line per stamp, shared by all worktrees; stats keep the last one per branch."""
+    path = runs_path(root)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def pct(x, n):
+    return round(100.0 * x / n) if n else None
+
+
+def quantile(xs, q):
+    xs = sorted(x for x in xs if x is not None)
+    return xs[min(len(xs) - 1, int(q * len(xs)))] if xs else None
+
+
+def iso_ts(s):
+    return datetime.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+
+
+def is_human(author):
+    # `gh pr list` drops the [bot] suffix (the Claude app shows up as "claude"), so ask GraphQL for __typename
+    login = (author or {}).get("login") or ""
+    return bool(login) and author.get("__typename") != "Bot" and not login.endswith("[bot]")
+
+
+MERGED_PRS = """query($q: String!, $endCursor: String) {
+  search(query: $q, type: ISSUE, first: 50, after: $endCursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest { title createdAt mergedAt
+      reviews(first: 100) { nodes { state body author { __typename login } } }
+      comments(first: 100) { nodes { author { __typename login } } } } }
+  }
+}"""
+
+
+def github_stats(root, days):
+    since = time.strftime("%Y-%m-%d", time.gmtime(time.time() - days * DAY))
+    r = subprocess.run(["gh", "api", "graphql", "--paginate", "-f", "query=" + MERGED_PRS,
+                        "-F", "q=repo:{owner}/{repo} is:pr is:merged merged:>=" + since,
+                        "--jq", ".data.search.nodes[]"], cwd=root, capture_output=True, text=True)
+    if r.returncode:
+        return {"error": tail(r.stderr.strip(), 300)}
+    prs = [json.loads(ln) for ln in r.stdout.splitlines() if ln.strip()]
+    nodes = lambda pr, key: (pr.get(key) or {}).get("nodes") or []
+    approvals = [len({rv["author"]["login"] for rv in nodes(pr, "reviews")
+                      if rv.get("state") == "APPROVED" and is_human(rv.get("author"))}) for pr in prs]
+    comments = [sum(is_human(c.get("author")) for c in nodes(pr, "comments"))
+                + sum(is_human(rv.get("author")) and bool((rv.get("body") or "").strip()) for rv in nodes(pr, "reviews"))
+                for pr in prs]
+    hours = [round((iso_ts(pr["mergedAt"]) - iso_ts(pr["createdAt"])) / 3600, 1) for pr in prs if pr.get("mergedAt")]
+    return {
+        "merged_prs": len(prs),
+        "approvals_per_pr": {"median": quantile(approvals, .5), "p95": quantile(approvals, .95)},
+        "merged_without_approval_pct": pct(sum(a == 0 for a in approvals), len(prs)),
+        "human_comments_per_pr": {"median": quantile(comments, .5), "p95": quantile(comments, .95)},
+        "hours_to_merge": {"median": quantile(hours, .5), "p95": quantile(hours, .95)},
+        "revert_prs_pct": pct(sum(pr["title"].startswith("Revert") for pr in prs), len(prs)),
+    }
+
+
+def cmd_stats(root, cfg, a):
+    since, runs = time.time() - a.days * DAY, {}
+    if os.path.exists(runs_path(root)):
+        with open(runs_path(root)) as f:
+            for ln in f:
+                if ln.strip():
+                    rec = json.loads(ln)
+                    if rec["at"] >= since:
+                        runs[rec["branch"]] = rec  # re-stamps of one change count once: the last
+    rs, cap = list(runs.values()), cfg.get("max_rounds", 3)
+    found = {s: sum(r["findings"].get(s, 0) for r in rs) for s in ("fixed", "wontfix", "pre-existing")}
+    total = sum(found.values())
+    out = {
+        "days": a.days,
+        "preflight": {
+            "changes": len(rs),
+            "one_round_pct": pct(sum(r["rounds"] <= 1 for r in rs), len(rs)),
+            "mean_rounds": round(sum(r["rounds"] for r in rs) / len(rs), 2) if rs else None,
+            "hit_round_cap_pct": pct(sum(r["rounds"] > cap for r in rs), len(rs)),
+            "tiers": {t: sum(r["tier"] == t for r in rs) for t in TIERS},
+            "median_minutes": quantile([r.get("minutes") for r in rs], .5),
+        },
+        "findings": {"total": total, "fixed_pct": pct(found["fixed"], total), "wontfix_pct": pct(found["wontfix"], total),
+                     "pre_existing_pct": pct(found["pre-existing"], total)},
+        "base_branch": dict(revert_rate(root, cfg, a.days), branch=base_ref(root, cfg)),
+        "circuit_breaker": breaker(root, cfg),
+    }
+    if a.github:
+        out["github"] = github_stats(root, a.days)
+    print(json.dumps(out, indent=1))
 
 
 def cmd_status(root, cfg, a):
@@ -466,11 +613,45 @@ def score(case, text, slack=5):
     return res
 
 
+JUDGE_PROMPT = """You grade a code review against a known answer. Reply with one JSON object and nothing else:
+{"caught": <number>, "findings": <number>}
+- "findings": how many distinct problems the review reports (0 if it says there is nothing to fix).
+- "caught": how many of these known bugs the review reports: the same defect counts even if it is worded
+  differently or cited at a nearby line; a vague hint at the area does not.
+%s
+REVIEW:
+<<<
+%s
+>>>"""
+
+
+def judge_score(case, text, a):
+    """An LLM reads the review: the defect counts, not just a file:line citation near it."""
+    known = "\n".join("  - %s lines %d-%d: %s" % (e["file"], e["lines"][0], e["lines"][1], e["summary"])
+                      for e in case["expect"]) or "  (none: this is a known-good change, so caught is 0)"
+    prompt = JUDGE_PROMPT % ("Known bugs:\n" + known, tail(text, 20000))
+    cmd, shell = (a.judge_cmd, True) if a.judge_cmd else (
+        ["claude", "-p", "--model", a.judge, "--max-turns", "1", "--output-format", "text"], False)
+    with tempfile.TemporaryDirectory() as empty:  # the judge reads the review, not the code
+        try:
+            r = subprocess.run(cmd, shell=shell, cwd=empty, input=prompt, capture_output=True, text=True, timeout=300)
+            got = json.loads(re.findall(r"\{[^{}]*\}", r.stdout)[-1])
+            caught, findings = int(got["caught"]), int(got["findings"])
+        except (subprocess.TimeoutExpired, IndexError, ValueError, KeyError, TypeError):
+            return {"id": case["id"], "kind": case["kind"], "error": "judge gave no verdict"}
+    res = {"id": case["id"], "kind": case["kind"], "findings": findings}
+    if case["kind"] == "bug":
+        res.update(expected=len(case["expect"]), caught=min(caught, len(case["expect"])))
+    return res
+
+
 def verdict(cur, prev):
     if cur["errors"]:
         return "%d case(s) failed to run; fix that before comparing" % cur["errors"]
     if not prev:
         return "baseline recorded"
+    if prev.get("scorer", "cites") != cur["scorer"]:
+        return "scorer changed (%s -> %s): new baseline" % (prev.get("scorer", "cites"), cur["scorer"])
     if sorted(prev["case_ids"]) != sorted(cur["case_ids"]) or prev["errors"]:
         return "case set changed: new baseline, compare from the next run"
     r0, r1, n0, n1 = prev["recall"] or 0, cur["recall"] or 0, prev["noise"] or 0, cur["noise"] or 0
@@ -501,7 +682,10 @@ def eval_run(root, cfg, a):
         finally:
             git(root, "worktree", "remove", "--force", wt, check=False)
             shutil.rmtree(tmp, ignore_errors=True)
-        res = score(c, text) if code == 0 else {"id": c["id"], "kind": c["kind"], "error": tail(text, 300)}
+        if code:
+            res = {"id": c["id"], "kind": c["kind"], "error": tail(text, 300)}
+        else:
+            res = judge_score(c, text, a) if (a.judge or a.judge_cmd) else score(c, text)
         results.append(res)
         print("%-14s %-5s %s" % (c["id"], c["kind"], res.get("error") or
               ("caught %d/%d, " % (res["caught"], res["expected"]) if c["kind"] == "bug" else "") +
@@ -516,6 +700,7 @@ def eval_run(root, cfg, a):
                 digest.update(rel.encode() + b"\0" + f.read())
     run = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "model": a.model or "default", "effort": a.effort,
            "reviewer": a.reviewer or "code-review", "guidance": digest.hexdigest()[:12],
+           "scorer": ("judge:" + (a.judge or "cmd")) if (a.judge or a.judge_cmd) else "cites",
            "case_ids": [c["id"] for c in cases], "errors": sum("error" in r for r in results),
            "recall": round(sum(r["caught"] for r in bugs) / expected, 3) if expected else None,
            "noise": round(sum(r["findings"] for r in clean) / len(clean), 2) if clean else None,
@@ -757,6 +942,11 @@ def main(argv=None):
     e.add_argument("--reviewer", help="run: shell command instead of `claude -p /code-review`; "
                                       "{range} and {effort} are substituted")
     e.add_argument("--timeout", type=int, default=1800)
+    e.add_argument("--judge", metavar="MODEL", help="run: score with an LLM judge (e.g. haiku) instead of file:line cites")
+    e.add_argument("--judge-cmd", help="run: shell command that reads the judge prompt on stdin and prints the JSON")
+    st = sub.add_parser("stats", help="the article's numbers: rounds, findings, reverts, and with --github human time")
+    st.add_argument("--days", type=int, default=30)
+    st.add_argument("--github", action="store_true", help="add merged-PR metrics from `gh`")
     h = sub.add_parser("hook", help="entry point for hooks/hooks.json")
     h.add_argument("event", choices=sorted(HOOKS))
     a = p.parse_args(argv)
@@ -767,7 +957,8 @@ def main(argv=None):
     if cfg is None:
         die("no %s here; run /land-it:init" % CONFIG)
     {"check": cmd_check, "risk": cmd_risk, "round": cmd_round, "findings": cmd_findings,
-     "stamp": cmd_stamp, "status": cmd_status, "eval": cmd_eval, "trust": cmd_trust}[a.cmd](root, cfg, a)
+     "stamp": cmd_stamp, "status": cmd_status, "eval": cmd_eval, "trust": cmd_trust,
+     "stats": cmd_stats}[a.cmd](root, cfg, a)
 
 
 if __name__ == "__main__":

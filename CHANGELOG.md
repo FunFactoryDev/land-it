@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.0
+
+- `/land-it:stats` and `land-it stats [--days N] [--github]`: the article's numbers for the repo. One-round passes,
+  mean rounds and the share that hit the cap, finding outcomes (fixed / won't fix / pre-existing), tier mix and
+  preflight minutes from a per-stamp log; the revert rate among first-parent commits on the base branch; with
+  `--github`, approvals and human comments per PR (median, p95), merged without approval, hours to merge, revert PRs.
+  Bots are told apart by GraphQL `__typename`, because `gh pr list` shows the Claude app as plain `claude`.
+- Circuit breaker, the gap the article names: on by default (`revert_rate` 0.05 over 14 days, at least 20 commits).
+  While tripped, every change's floor rises one tier; `risk` and preflight report it, the stamp enforces it.
+- `land-it eval run --judge MODEL` (or `--judge-cmd`): an LLM judge decides whether each recorded defect is reported
+  and counts distinct findings; runs with different scorers aren't compared.
+
 ## 0.4.0
 
 **Upgrading:** in each repo, type `/land-it:trust` once. Until then land-it's hooks and `land-it check` won't run
