@@ -1,48 +1,75 @@
-# land-it: AI review and security review on every pull request.
-# Secrets: CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`, Pro/Max/Team/Enterprise)
-#          or ANTHROPIC_API_KEY for `review`; the security action takes an API key only.
+# land-it: review every pushed commit range of a pull request and set the `land-it/review` commit status.
+# The status comes from what the review recorded, not from the job running: success only when the tier's review
+# stages completed and no Important finding is open; failure with open Important findings; error when the review
+# didn't complete. Make `land-it/review` a required check (see /land-it:init --protect).
+#
+# Secrets: CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`, Pro/Max/Team/Enterprise) or ANTHROPIC_API_KEY.
 # Install the Claude GitHub App first: https://github.com/apps/claude (or run /install-github-app).
+# Pull requests from forks get no secrets and a read-only token, so their run ends in `error`: review them from a
+# branch in this repository.
 name: land-it
 
 on:
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
 
+concurrency:
+  group: land-it-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  LAND_IT_REF: v0.8.0  # the land-it release this workflow runs; /land-it:init writes the installed one
+
 jobs:
   review:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
-      pull-requests: read
-      issues: read
+      pull-requests: write
+      statuses: write
       id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      LAND_IT_BASE: ${{ github.event.pull_request.base.sha }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
-          fetch-depth: 1
-      - uses: anthropics/claude-code-action@v1
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Get land-it
+        run: |
+          git clone --quiet --depth 1 --branch "$LAND_IT_REF" https://github.com/FunFactoryDev/land-it.git "$RUNNER_TEMP/land-it"
+          echo "$RUNNER_TEMP/land-it/bin" >> "$GITHUB_PATH"
+          git remote set-head origin "${{ github.event.pull_request.base.ref }}"  # security-review diffs against origin/HEAD
+
+      - name: Mark the commit as under review
+        run: gh api "repos/${{ github.repository }}/statuses/$HEAD_SHA" -f state=pending -f context=land-it/review -f description=reviewing
+
+      - name: Pick the range
+        id: range
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "${{ github.event.action }}" = synchronize ] && git merge-base --is-ancestor "$BEFORE" "$HEAD_SHA" 2>/dev/null; then
+            echo "range=$BEFORE..$HEAD_SHA" >> "$GITHUB_OUTPUT"        # only the commits this push added
+          else
+            echo "range=$LAND_IT_BASE..$HEAD_SHA" >> "$GITHUB_OUTPUT"  # a new PR, reopened, or force-pushed
+          fi
+
+      - uses: anthropics/claude-code-action@16f9f71ab9c490faf367f94dd294897edc25be33  # v1
+        continue-on-error: true  # the verdict decides: a review that didn't finish becomes an `error` status
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
-          plugins: "code-review@claude-code-plugins"
-          prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
-          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
+          prompt: "/land-it:ci-review ${{ steps.range.outputs.range }}"
+          claude_args: >-
+            --plugin-dir ${{ runner.temp }}/land-it
+            --allowedTools "Read,Grep,Glob,Skill,Agent,Bash(land-it *),Bash(git diff *),Bash(git log *),Bash(git show *),Bash(git blame *)"
 
-  security:
-    if: github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 2
-      - uses: anthropics/claude-code-security-review@main
-        with:
-          comment-pr: true
-          claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude-model: claude-opus-5-5
+      - name: Verdict
+        if: always()
+        run: land-it ci-verdict --sha "$HEAD_SHA" --pr "${{ github.event.pull_request.number }}"

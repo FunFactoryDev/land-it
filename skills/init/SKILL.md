@@ -74,10 +74,14 @@ exists, add the missing Testing / Risk / How to revert sections to it.
 
 ## 6. Optional, ask first (they touch GitHub or cost money)
 
-- **`--ci` / "AI review on every PR"**: copy `templates/workflows/land-it.yml` to `.github/workflows/`.
+- **`--ci` / "AI review on every PR"**: copy `templates/workflows/land-it.yml` to `.github/workflows/`, with
+  `LAND_IT_REF` set to `v<version>` from `${CLAUDE_PLUGIN_ROOT}/.claude-plugin/plugin.json`, so CI runs the land-it
+  release the user has. Each push gets a `land-it/review` commit status: the new commits are reviewed by
+  `/land-it:ci-review`, and `land-it ci-verdict` sets success / failure / error from what the review recorded.
   Tell the user which secrets it needs and that the Claude GitHub App must be installed (`/install-github-app`).
   If the repo has no CI running its checks, also write a plain CI workflow that runs the same commands.
-- **`--sweep` / "nightly bug sweep"**: copy `templates/workflows/land-it-sweep.yml` to `.github/workflows/`. Each
+- **`--sweep` / "nightly bug sweep"**: copy `templates/workflows/land-it-sweep.yml` to `.github/workflows/`
+  (same `LAND_IT_REF`). Each
   night it reviews one `risk.high` area of existing code and files new bugs as one issue labeled `land-it-sweep`.
   Same secrets and app as `--ci`. Tell the user what a run costs: one code review of one area per night.
 - **`--protect` / branch protection**: follow `branch-protection.md` next to this file. Ask whether the user

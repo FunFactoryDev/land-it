@@ -418,8 +418,17 @@ class Measure(unittest.TestCase):
             msg = 'Revert "change %d"' % i if i < reverts else "change %d" % i
             sh(r.root, "git", "commit", "-q", "--allow-empty", "-m", msg)
 
+    def test_circuit_breaker_only_observes_by_default(self):
+        r = Repo(self, {})
+        self.commits_on_main(r, 20, reverts=2)
+        branch(r)
+        r.write("docs/a.md", "x\n")
+        out = json.loads(r.cli("risk").stdout)
+        self.assertTrue(out["circuit_breaker"]["tripped"])
+        self.assertEqual((out["circuit_breaker"]["mode"], out["tier"]), ("observe", "low"))
+
     def test_circuit_breaker_raises_the_floor(self):
-        r = Repo(self, {"checks": {"ok": "true"}})
+        r = Repo(self, {"checks": {"ok": "true"}, "circuit_breaker": {"mode": "enforce"}})
         self.commits_on_main(r, 20, reverts=2)  # 2 of 21 > 5%
         branch(r)
         r.write("docs/a.md", "x\n")
@@ -468,11 +477,11 @@ class Measure(unittest.TestCase):
         r = Repo(self, {})
         bot, human = lambda login: {"__typename": "Bot", "login": login}, lambda login: {"__typename": "User", "login": login}
         prs = [{"title": "Add x", "createdAt": "2026-10-01T10:00:00Z", "mergedAt": "2026-10-01T12:00:00Z",
-                "reviews": {"nodes": [{"author": human("alice"), "state": "APPROVED", "body": ""},
+                "reviews": {"nodes": [{"author": human("alice"), "state": "APPROVED", "body": "", "comments": {"totalCount": 2}},
                                       {"author": bot("claude"), "state": "APPROVED", "body": "lgtm"}]},
                 "comments": {"nodes": [{"author": human("bob")}, {"author": bot("claude")}]}},
                {"title": 'Revert "Add x"', "createdAt": "2026-10-02T00:00:00Z", "mergedAt": "2026-10-02T10:00:00Z",
-                "reviews": {"nodes": [{"author": bot("claude"), "state": "APPROVED", "body": "ok"}]},
+                "reviews": {"nodes": [{"author": bot("claude"), "state": "APPROVED", "body": "ok", "comments": {"totalCount": 5}}]},
                 "comments": {"nodes": []}}]
         fake = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, fake)
@@ -484,7 +493,7 @@ class Measure(unittest.TestCase):
         gh = json.loads(r.cli("stats", "--github", env={"PATH": fake + os.pathsep + os.environ["PATH"]}).stdout)["github"]
         self.assertEqual(gh["merged_prs"], 2)
         self.assertEqual(gh["merged_without_approval_pct"], 50, "the Claude app's approval doesn't count")
-        self.assertEqual(gh["human_comments_per_pr"]["p95"], 1)
+        self.assertEqual(gh["human_comments_per_pr"]["p95"], 3, "a person's inline review comments count, a bot's don't")
         self.assertEqual(gh["revert_prs_pct"], 50)
         self.assertEqual(gh["hours_to_merge"]["median"], 6.0, "an even sample's median is the mean of the middle two")
 
@@ -781,6 +790,94 @@ class Guarantees(unittest.TestCase):
         self.assertIn("baseline", r.cli("eval", "run", "--reviewer", "echo a.py:2").stdout)
         r.cli("eval", "add", "--commit", bug, "--file", "a.py", "--line", "1", "--summary", "x too", "--id", "c1")
         self.assertIn("case set changed", r.cli("eval", "run", "--reviewer", "echo a.py:2").stdout)
+
+
+
+FAKE_GH_CI = """#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["GH_LOG"], "a") as f:
+    f.write(json.dumps(args) + "\\n")
+store = os.environ["GH_STORE"]
+bodies = open(store).read().split("\\x1e") if os.path.exists(store) else []
+if "--paginate" in args:
+    print("\\n".join(b for b in bodies if b))
+elif any(a.startswith("body=") for a in args):
+    if any(a.startswith("commit_id=") for a in args) and os.environ.get("REJECT_INLINE"):
+        sys.exit("HTTP 422: pull_request_review_thread.line must be part of the diff")
+    with open(store, "a") as f:
+        f.write(next(a for a in args if a.startswith("body="))[5:] + "\\x1e")
+"""
+
+
+class CIVerdict(unittest.TestCase):
+    def setUp(self):
+        self.r = r = Repo(self, {})
+        base = sh(r.root, "git", "rev-parse", "HEAD").strip()
+        branch(r)
+        r.write("src/a.py", "x = 1\n")
+        r.commit("change")
+        fake = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, fake)
+        with open(os.path.join(fake, "gh"), "w") as f:
+            f.write(FAKE_GH_CI)
+        os.chmod(os.path.join(fake, "gh"), 0o755)
+        self.log = os.path.join(fake, "log")
+        self.env = {"PATH": fake + os.pathsep + os.environ["PATH"], "GH_LOG": self.log,
+                    "GH_STORE": os.path.join(fake, "store"), "LAND_IT_BASE": base}
+
+    def verdict(self, *extra, **env):
+        out = self.r.cli("ci-verdict", "--sha", "abc123", "--pr", "7", *extra, env=dict(self.env, **env))
+        return out.returncode, json.loads(out.stdout)
+
+    def statuses(self):
+        with open(self.log) as f:
+            calls = [json.loads(ln) for ln in f]
+        return [dict(a.split("=", 1) for a in c if a.startswith(("state=", "context="))) for c in calls
+                if any(a.startswith("state=") for a in c)]
+
+    def reviewed(self):
+        self.r.cli("round", env=self.env)
+        for kind in ("code", "security"):
+            self.r.cli("stage", kind, "--status", "completed", env=self.env)
+
+    def test_error_until_the_review_completes(self):
+        code, out = self.verdict()
+        self.assertEqual((code, out["state"], out["tier"]), (2, "error", "medium"), "the job ran, the review didn't")
+        self.assertEqual(self.statuses()[-1], {"state": "error", "context": "land-it/review"})
+        self.r.cli("round", env=self.env)
+        self.r.cli("stage", "code", "--status", "completed", env=self.env)
+        self.assertIn("security", self.verdict()[1]["description"], "a medium-tier change needs both stages")
+
+    def test_failure_while_an_important_finding_is_open_and_no_reposts(self):
+        self.reviewed()
+        self.r.cli("findings", "add", stdin=json.dumps([{"file": "src/a.py", "line": 1, "summary": "x is wrong"}]),
+                   env=self.env)
+        code, out = self.verdict()
+        self.assertEqual((code, out["state"], out["posted"]), (1, "failure", 1))
+        self.assertEqual(self.verdict()[1]["posted"], 0, "the next push doesn't post it again")
+        self.r.cli("findings", "resolve", "F1", "--status", "fixed", env=self.env)
+        self.assertEqual(self.verdict()[:1] + (self.statuses()[-1]["state"],), (0, "success"))
+
+    def test_findings_github_cant_anchor_go_in_one_summary(self):
+        self.reviewed()
+        self.r.cli("findings", "add", stdin=json.dumps([{"file": "src/a.py", "line": 1, "summary": "a"},
+                                                         {"file": "src/b.py", "summary": "no line"}]), env=self.env)
+        self.verdict(REJECT_INLINE="1")
+        with open(self.env["GH_STORE"]) as f:
+            bodies = [b for b in f.read().split("\x1e") if b]
+        self.assertEqual(len(bodies), 1)
+        self.assertIn("outside the diff", bodies[0])
+
+    def test_claude_cant_set_the_status_itself(self):
+        out = self.r.hook("pre-bash", tool_input={"command": "land-it ci-verdict --sha abc --pr 7"})
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_dry_run_sets_no_status(self):
+        self.reviewed()
+        code, out = self.verdict("--dry-run")
+        self.assertEqual((code, out["state"]), (0, "success"))
+        self.assertEqual(self.statuses(), [])
 
 
 if __name__ == "__main__":

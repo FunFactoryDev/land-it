@@ -244,7 +244,9 @@ def classify(files, cfg):
 
 
 def base_ref(root, cfg):
-    base = cfg.get("base") or git(root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
+    # LAND_IT_BASE first: in CI it's the pull request's base SHA, which no local guess can beat
+    base = os.environ.get("LAND_IT_BASE") or cfg.get("base") or git(
+        root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
     return base or next((b for b in ("main", "master") if git(root, "rev-parse", "--verify", "--quiet", b, check=False)), "")
 
 
@@ -255,7 +257,7 @@ def merge_base(root, cfg):
 
 REVERTS_COMMIT = re.compile(r"This reverts commit ([0-9a-f]{7,40})")
 REVERT = re.compile(r'^Revert "|' + REVERTS_COMMIT.pattern, re.M)
-BREAKER = {"revert_rate": 0.05, "days": 14, "min_commits": 20}
+BREAKER = {"revert_rate": 0.05, "days": 14, "min_commits": 20, "mode": "observe"}
 
 
 def revert_rate(root, cfg, days):
@@ -268,21 +270,23 @@ def revert_rate(root, cfg, days):
 
 
 def breaker(root, cfg):
-    """The article's open gap: tighten review when reverts rise. Raises the floor one tier while tripped."""
+    """The article's open gap: tighten review when reverts rise. In "enforce" mode a tripped breaker raises
+    the floor one tier; the default "observe" only reports it, until the team decides to act on it."""
     conf = cfg.get("circuit_breaker")
     if conf is False:
         return None
     conf = dict(BREAKER, **(conf or {}))
     r = revert_rate(root, cfg, conf["days"])
     r.update(days=conf["days"], threshold=conf["revert_rate"],
-             tripped=r["commits"] >= conf["min_commits"] and (r["rate"] or 0) > conf["revert_rate"])
+             mode=conf["mode"], tripped=r["commits"] >= conf["min_commits"]
+             and r["reverts"] > conf["revert_rate"] * r["commits"])  # the exact rate, not the rounded one
     return r
 
 
 def floor_tier(root, cfg):
     tier, per = classify(changed_files_or_die(root, cfg), cfg)
     b = breaker(root, cfg)
-    if b and b["tripped"] and per:
+    if b and b["tripped"] and b["mode"] == "enforce" and per:
         tier = TIERS[min(TIERS.index(tier) + 1, len(TIERS) - 1)]
     return tier, per, b
 
@@ -481,7 +485,7 @@ def cmd_stamp(root, cfg, a):
     tier = a.tier or floor
     if TIERS.index(tier) < TIERS.index(floor):
         die("tier %s is below %s from the changed paths%s: a tier can be raised, never lowered"
-            % (tier, floor, " and the tripped circuit breaker" if b and b["tripped"] else ""))
+            % (tier, floor, " and the tripped circuit breaker" if b and b["tripped"] and b["mode"] == "enforce" else ""))
     led = load_state(root, ledger_name(root))
     fs, rounds = led.get("findings", []), led.get("rounds", [])
     unanswered = [x["id"] for x in fs if x["status"] == "open"]
@@ -553,7 +557,7 @@ MERGED_PRS = """query($q: String!, $endCursor: String) {
   search(query: $q, type: ISSUE, first: 50, after: $endCursor) {
     pageInfo { hasNextPage endCursor }
     nodes { ... on PullRequest { title createdAt mergedAt
-      reviews(first: 100) { nodes { state body author { __typename login } } }
+      reviews(first: 100) { nodes { state body author { __typename login } comments { totalCount } } }
       comments(first: 100) { nodes { author { __typename login } } } } }
   }
 }"""
@@ -571,6 +575,8 @@ def github_stats(root, days):
                       if rv.get("state") == "APPROVED" and is_human(rv.get("author"))}) for pr in prs]
     comments = [sum(is_human(c.get("author")) for c in nodes(pr, "comments"))
                 + sum(is_human(rv.get("author")) and bool((rv.get("body") or "").strip()) for rv in nodes(pr, "reviews"))
+                + sum(((rv.get("comments") or {}).get("totalCount") or 0) for rv in nodes(pr, "reviews")
+                      if is_human(rv.get("author")))
                 for pr in prs]
     hours = [round((iso_ts(pr["mergedAt"]) - iso_ts(pr["createdAt"])) / 3600, 1) for pr in prs if pr.get("mergedAt")]
     return {
@@ -992,6 +998,59 @@ def cmd_sweep_target(root, cfg, a):
     print(json.dumps({"target": cands[day % len(cands)], "candidates": cands, "from": source}, indent=1))
 
 
+# --- CI verdict: a commit status per pushed SHA, from recorded stages and findings ---------
+
+CI_CONTEXT = "land-it/review"
+
+
+def finding_mark(f):
+    key = "%s\0%s" % (f["file"], re.sub(r"\s+", " ", f["summary"].strip().lower()))
+    return "<!-- land-it:%s -->" % hashlib.sha1(key.encode()).hexdigest()[:12]
+
+
+def publish_findings(root, pr, sha, findings):
+    """Inline comments for findings not posted on this PR before; ones GitHub can't anchor go in one summary."""
+    posted = gh(root, "api", "--paginate", "repos/{owner}/{repo}/pulls/%s/comments" % pr, "--jq", ".[].body")
+    posted += gh(root, "api", "--paginate", "repos/{owner}/{repo}/issues/%s/comments" % pr, "--jq", ".[].body")
+    new, unanchored = [f for f in findings if finding_mark(f) not in posted], []
+    for f in new:
+        body = "**%s** · land-it\n\n%s\n\n%s" % (f["severity"].capitalize(), f["summary"], finding_mark(f))
+        line = re.match(r"\d+", str(f.get("line") or ""))
+        r = gh_run(root, "api", "repos/{owner}/{repo}/pulls/%s/comments" % pr, "-f", "body=" + body,
+                   "-f", "commit_id=" + sha, "-f", "path=" + f["file"], "-F", "line=%s" % (line.group() if line else 0),
+                   "-f", "side=RIGHT") if line else None
+        if not r or r.returncode:  # not on a changed line of this diff
+            unanchored.append(f)
+    if unanchored:
+        gh(root, "api", "repos/{owner}/{repo}/issues/%s/comments" % pr, "-f", "body=" + "land-it findings outside the diff:\n\n"
+           + "\n".join("- **%s** `%s:%s` %s %s" % (f["severity"].capitalize(), f["file"], f.get("line") or "?",
+                                                   f["summary"], finding_mark(f)) for f in unanchored))
+    return len(new)
+
+
+def cmd_ci_verdict(root, cfg, a):
+    tier, _, _ = floor_tier(root, cfg)
+    led = load_state(root, ledger_name(root))
+    rounds, fs = led.get("rounds") or [], led.get("findings") or []
+    stages = (rounds[-1].get("stages") or {}) if rounds else {}
+    # behavior checks are the repo's own CI; this verdict covers the review stages
+    required = [k for k in dict(REQUIRED_STAGES, **(cfg.get("required_stages") or {})).get(tier, []) if k != "verify"]
+    missing = [k for k in required if not stage_done(k, stages.get(k))]
+    important = [f for f in fs if f["status"] == "open" and f.get("severity", "important") == "important"]
+    if missing:
+        state, desc = "error", "review didn't complete: %s" % ", ".join(missing)
+    elif important:
+        state, desc = "failure", "%d important finding(s) on this %s-tier change" % (len(important), tier)
+    else:
+        state, desc = "success", "%s-tier change reviewed (%s), no important findings" % (tier, ", ".join(required))
+    posted = publish_findings(root, a.pr, a.sha, [f for f in fs if f["status"] == "open"]) if a.pr and not missing else 0
+    if not a.dry_run:
+        gh(root, "api", "repos/{owner}/{repo}/statuses/" + a.sha, "-f", "state=" + state, "-f", "context=" + CI_CONTEXT,
+           "-f", "description=" + desc[:140])
+    print(json.dumps({"state": state, "description": desc, "tier": tier, "sha": a.sha, "posted": posted}, indent=1))
+    sys.exit({"success": 0, "failure": 1}.get(state, 2))
+
+
 # --- hooks -------------------------------------------------------------------
 
 def emit(obj):
@@ -1120,6 +1179,7 @@ GH_PR_APPROVE = re.compile(GH_PR + r"review\b[^;&|\n]*(?:--approve|\s-a\b)")
 TRUST_CMD = re.compile(r"land-it\S*\s+(?:trust|hook)\b|\.land-it/trust\.json")
 # Gates the wrapper because land-it's skills pre-approve `Bash(land-it *)`. A direct `gh api` or `gh pr comment`
 # isn't pre-approved by them, so Claude Code's own permission prompt already covers it.
+CI_VERDICT = re.compile(r"land-it\S*\s+ci-verdict\b")
 THREAD_WRITE = re.compile(r"land-it\S*\s+threads\b[^;&|\n]*\b(?:reply|resolve)\b")
 
 
@@ -1131,8 +1191,8 @@ def decide(decision, reason):
 def hook_pre_bash(data, root, cfg):
     cmd = (data.get("tool_input") or {}).get("command") or ""
     create, merge, approve = GH_PR_CREATE.search(cmd), GH_PR_MERGE.search(cmd), GH_PR_APPROVE.search(cmd)
-    trust, thread_write = TRUST_CMD.search(cmd), THREAD_WRITE.search(cmd)
-    if not (create or merge or approve or trust or thread_write):
+    trust, thread_write, ci_verdict = TRUST_CMD.search(cmd), THREAD_WRITE.search(cmd), CI_VERDICT.search(cmd)
+    if not (create or merge or approve or trust or thread_write or ci_verdict):
         return
     # every deny before any ask: a combined command must not slip a deny past an ask's prompt
     if trust:
@@ -1140,6 +1200,8 @@ def hook_pre_bash(data, root, cfg):
                "(and the hook entry point and the trust store aren't for Claude's shell).")
     if approve:
         decide("deny", "land-it: an agent's approval never counts as a person's. Approving a PR is for a human.")
+    if ci_verdict:
+        decide("deny", "land-it: the CI workflow sets the land-it/review status after the review, not Claude.")
     stamp, stamped_head = {}, False
     if create or merge:
         stamp = load_state(root).get("stamp") or {}
@@ -1239,6 +1301,10 @@ def main(argv=None):
                     help="a PR number, #N or URL (default: this branch's PR), or `reply`/`resolve` and a thread id")
     th.add_argument("--body")
     th.add_argument("--resolve", action="store_true")
+    cv = sub.add_parser("ci-verdict", help="CI: set the land-it/review status of a SHA from the recorded review")
+    cv.add_argument("--sha", required=True)
+    cv.add_argument("--pr", help="also post open findings on this pull request (deduplicated)")
+    cv.add_argument("--dry-run", action="store_true", help="print the verdict without setting the status")
     sw = sub.add_parser("sweep-target", help="today's area for the nightly sweep, rotating over risk.high")
     sw.add_argument("--day", type=int, help="day number to rotate by (default: day of the year)")
     st = sub.add_parser("stats", help="the article's numbers: rounds, findings, reverts, and with --github human time")
@@ -1255,7 +1321,8 @@ def main(argv=None):
         die("no %s here; run /land-it:init" % CONFIG)
     {"check": cmd_check, "risk": cmd_risk, "round": cmd_round, "findings": cmd_findings, "stage": cmd_stage,
      "stamp": cmd_stamp, "status": cmd_status, "eval": cmd_eval, "trust": cmd_trust,
-     "stats": cmd_stats, "threads": cmd_threads, "sweep-target": cmd_sweep_target}[a.cmd](root, cfg, a)
+     "stats": cmd_stats, "threads": cmd_threads, "sweep-target": cmd_sweep_target,
+     "ci-verdict": cmd_ci_verdict}[a.cmd](root, cfg, a)
 
 
 if __name__ == "__main__":

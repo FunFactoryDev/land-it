@@ -9,24 +9,36 @@ on:
     - cron: "17 3 * * *"
   workflow_dispatch:
 
+concurrency:
+  group: land-it-sweep
+  cancel-in-progress: false  # let a running sweep finish; the next night picks the next area
+
+env:
+  LAND_IT_REF: v0.8.0  # the land-it release this workflow runs; /land-it:init writes the installed one
+
 jobs:
   sweep:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
       issues: write
       id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           fetch-depth: 0
-      - uses: anthropics/claude-code-action@v1
-        env:
-          GH_TOKEN: ${{ github.token }}
+
+      - name: Get land-it
+        run: git clone --quiet --depth 1 --branch "$LAND_IT_REF" https://github.com/FunFactoryDev/land-it.git "$RUNNER_TEMP/land-it"
+
+      - uses: anthropics/claude-code-action@16f9f71ab9c490faf367f94dd294897edc25be33  # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          plugin_marketplaces: "https://github.com/FunFactoryDev/land-it.git"
-          plugins: "land-it@land-it-marketplace"
           prompt: "/land-it:sweep --ci"
-          claude_args: '--allowedTools "Read,Grep,Glob,Skill,Agent,Bash(land-it *),Bash(git log *),Bash(git blame *),Bash(gh issue list *),Bash(gh issue create *),Bash(gh label create *)"'
+          claude_args: >-
+            --plugin-dir ${{ runner.temp }}/land-it
+            --allowedTools "Read,Grep,Glob,Skill,Agent,Bash(land-it *),Bash(git log *),Bash(git blame *),Bash(gh issue list *),Bash(gh issue create *),Bash(gh label create *)"

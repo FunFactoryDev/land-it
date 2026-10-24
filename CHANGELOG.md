@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.8.0
+
+CI that proves each pushed commit was reviewed (audit findings R11, R12), and a circuit breaker that observes first.
+
+**Upgrading:** rerun `/land-it:init --ci` (and `--sweep`) to replace the workflow files, then make `land-it/review`
+the required check instead of the old `review` / `security` jobs. The circuit breaker now only reports by default;
+add `"circuit_breaker": {"mode": "enforce"}` to keep 0.5–0.7 behavior.
+
+- **Per-commit review.** The `land-it` workflow reviews only the commits each push added (`before..after`; the whole
+  PR when it opens or after a force-push) with the new `/land-it:ci-review` skill, which records findings and stages
+  and changes nothing. Before, a re-run on a new push could skip the review because a comment already existed.
+- **A status that means the analysis finished.** `land-it ci-verdict` sets the `land-it/review` commit status from
+  the recorded review, by the same policy as the local stamp: `success` only when the tier's review stages completed
+  and no Important finding is open, `failure` with open Important findings, `error` when the review didn't complete.
+  A failed or skipped review can no longer show as a green check. Open findings are posted inline once (fingerprinted),
+  ones outside the diff in one summary comment. Claude's shell can't run `ci-verdict`.
+- **Pinned and bounded workflows.** Actions pinned to commit SHAs; land-it itself runs from the release tag in
+  `LAND_IT_REF` via `--plugin-dir`; `timeout-minutes`; `concurrency` cancels a superseded PR run. The separate
+  security action (API key only, `@main`, could pass without analyzing) is replaced by the bundled `/security-review`
+  in the same run. `LAND_IT_BASE` gives the PR's base SHA to land-it.
+- **Branch protection:** read the current rules, merge, show the diff, then replace, since a `PUT` drops what it
+  leaves out. The solo profile says what it doesn't cover.
+- **Circuit breaker** defaults to `"mode": "observe"` and compares the exact revert rate with the threshold.
+- `stats --github` counts people's inline review comments.
+
 ## 0.7.0
 
 The stamp now means what the README says. Each item closes a finding from the independent audit, with its

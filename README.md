@@ -83,7 +83,7 @@ flowchart TD
 | An approval covers one specific commit | **PreToolUse hook.** Claude's `gh pr create` is allowed only when HEAD's tree is exactly the stamped tree |
 | An agent's approval never counts as a person's | Claude's `gh pr review --approve` is denied; `gh pr merge` asks you unless HEAD is stamped low-tier |
 | PR template: Testing, Risk, How to revert | init installs it; preflight fills it from real command output |
-| AI review and security review on every PR; all threads resolved; stale approvals dismissed | `init --ci --protect`: a GitHub workflow and branch protection, applied only after you confirm |
+| AI review and security review on every PR, each new commit reviewed; a status that means the analysis finished; all threads resolved; stale approvals dismissed | **`init --ci`**: every push gets its new commits reviewed by `/land-it:ci-review` in GitHub Actions, and `land-it ci-verdict` sets the `land-it/review` commit status from what the review recorded: `success` only when the tier's stages completed and no Important finding is open, `failure` otherwise, `error` when the review didn't finish. Findings are posted inline, never twice. `--protect` makes the status required (read-merge-confirm, never a blind replace) |
 | Incidents become evals; a reviewer change is kept only if the score rises | **`/land-it:eval`**: the commit behind a revert becomes a case; `run` scores recall and noise and says keep or revert; `eval scan` lists reverts not recorded yet |
 | Nightly review agents scan existing code for old bugs | **`/land-it:sweep`** and a nightly workflow: one `risk.high` area per night by rotation, new bugs filed as one issue, ones already filed skipped |
 | Track human time (approvals per PR, median and p95; human comments; wait time) with reverts and incidents as the guardrail | **`/land-it:stats`**: one-round passes, mean rounds, finding outcomes, the revert rate on the base branch; with `--github`, approvals and human comments per PR and hours to merge, bots excluded |
@@ -124,6 +124,7 @@ Requirements: git, Python 3.9+ (stdlib only, nothing to install), a recent Claud
 | `/land-it:preflight` | The pre-PR pipeline: risk tier → review round → checks → simplify → code review → security review → behavior check → findings ledger → stamp → PR body |
 | `/land-it:eval` | `add`: record the commit behind an incident as a case. `run`: review every case under today's rules, score recall and noise, compare with the last run. `list` |
 | `/land-it:trust` | Approve the config's commands. Only a command you type counts; Claude can't invoke it |
+| `/land-it:ci-review` | CI only: the workflow's reviewer for one pushed commit range. It records findings and stages; it changes and posts nothing |
 | `/land-it:respond` | Answer every unresolved review thread on a PR: ledger → fix or won't fix → replies and resolution, posted after you confirm |
 | `/land-it:sweep` | Review one area of existing code for old bugs (today's high-risk area, or a path) and file new findings as one issue. `--ci` for the scheduled run |
 | `/land-it:stats` | The article's numbers for this repo, read against its goal: less human time, no more reverts. `--github` adds human time per PR |
@@ -142,8 +143,8 @@ Requirements: git, Python 3.9+ (stdlib only, nothing to install), a recent Claud
 |---|---|
 | **Enforced by land-it** | The checks passed on exactly this tree without changing it, and their last run on it didn't fail. The tier's review stages are recorded for this round (low: code; medium: + security; high: + verify, which may be `not_run` with a reason). Every finding has an answer, with a reason unless fixed. The tier isn't below what the paths and the circuit breaker require, and the base branch was known. |
 | **Rests on the agent following the skill** | That a recorded stage really ran and what it found. The record is local; land-it can't check a review's content. |
-| **Enforced only by GitHub, if you set it up** | That the PR on GitHub holds this tree, that review ran on each pushed commit, who may merge. The hooks mirror these rules for Claude's commands; branch protection and required checks are what make them hold. |
-| **Not there yet** | A tamper-proof, server-issued receipt and per-commit review status in CI (planned). |
+| **Enforced by GitHub, if you set it up** | That each pushed commit was reviewed (the required `land-it/review` status from the CI workflow), that threads are resolved, who may merge. The hooks mirror these rules for Claude's commands; branch protection is what makes them hold. |
+| **Not there yet** | A tamper-proof, server-issued receipt. The CI status, like the local stamp, is computed from what the reviewer recorded. |
 
 ## Hooks
 
@@ -152,7 +153,7 @@ Requirements: git, Python 3.9+ (stdlib only, nothing to install), a recent Claud
 | `UserPromptSubmit` | Snapshots the working tree, so each turn is judged on its own changes (your edits between turns aren't Claude's) |
 | `PostToolUse` (Edit, Write) | Runs the matching `on_edit` commands on the edited file; a failure goes back to Claude |
 | `Stop` | If the turn changed non-docs files: runs `stop_checks` (path-scoped ones only when touched). Red: blocks the stop with the output, at most 3 times per turn. A docs-only turn, or a stop on the same red tree Claude already saw, passes |
-| `PreToolUse` (Bash) | `gh pr create` needs the stamp on HEAD's tree; `gh pr review --approve` is denied; `gh pr merge` asks you unless HEAD is stamped low; `land-it trust` from Claude's shell is denied; `land-it threads reply` and `resolve` always ask you, because they act under your account. Every deny is checked before any ask, so a combined command can't slip a deny through a prompt |
+| `PreToolUse` (Bash) | `gh pr create` needs the stamp on HEAD's tree; `gh pr review --approve` is denied; `gh pr merge` asks you unless HEAD is stamped low; `land-it trust` and `land-it ci-verdict` from Claude's shell are denied; `land-it threads reply` and `resolve` always ask you, because they act under your account. Every deny is checked before any ask, so a combined command can't slip a deny through a prompt |
 | `UserPromptExpansion` | When *you* type `/land-it:trust`, records trust for the current commands |
 
 ## Configuration: `.claude/land-it.json`
@@ -185,7 +186,7 @@ Requirements: git, Python 3.9+ (stdlib only, nothing to install), a recent Claud
 | `review_effort` | `/code-review` effort per tier. `max` is the deepest local pass, but it fans out to dozens of agents and can take most of an hour even on a small diff |
 | `base` | The branch PRs target, if it isn't `origin/HEAD`, `main` or `master`. Without a known base, `risk` and `stamp` refuse rather than guess |
 | `required_stages` | Review stages the stamp requires per tier. Default `{"low": ["code"], "medium": ["code", "security"], "high": ["code", "security", "verify"]}` |
-| `circuit_breaker` | On by default: `{"revert_rate": 0.05, "days": 14, "min_commits": 20}`. While reverts among first-parent commits on the base branch are above the rate, every change's floor is one tier higher. `false` turns it off |
+| `circuit_breaker` | Default `{"revert_rate": 0.05, "days": 14, "min_commits": 20, "mode": "observe"}`: reports when reverts among first-parent commits on the base branch pass the rate. With `"mode": "enforce"`, every change's floor is one tier higher while it's tripped. `false` turns it off |
 
 Globs follow gitignore rules: `*` stays inside a path segment, `**` crosses segments, `{a,b}` alternates, a pattern
 without `/` matches at any depth, and a directory pattern covers everything under it.
@@ -257,6 +258,7 @@ The plugin puts `land-it` on Claude's PATH; the skills call it. You can call it 
 | `land-it eval [list \| scan \| add … \| run …]` | Reviewer evals; `scan` finds reverts that aren't cases yet |
 | `land-it threads [PR \| reply ID --body B [--resolve] \| resolve ID]` | Unresolved review threads on a PR (given as N, #N or a URL; bots told apart); reply to one, resolve one |
 | `land-it sweep-target [--day N]` | Today's area for the sweep, rotating over `risk.high` |
+| `land-it ci-verdict --sha SHA [--pr N] [--dry-run]` | CI: set the `land-it/review` status of a commit from the recorded review and post open findings (deduplicated). Claude's shell can't run it |
 | `land-it stats [--days N] [--github]` | One-round passes, rounds, finding outcomes, reverts, the circuit breaker; GitHub human time |
 
 ## What lives where
@@ -274,6 +276,7 @@ The plugin puts `land-it` on Claude's PATH; the skills call it. You can call it 
 
 - The gates cover Claude's tool calls. You can still run `gh pr create` yourself; that's deliberate.
 - The Bash gates match command text (the usual `gh pr …` forms, `-R/--repo` included), not a parsed shell. They mirror GitHub's branch protection and required checks, which is where enforcement that must hold belongs. The policy hook fails closed: if it crashes or times out, the command is blocked.
+- Pull requests from forks get no secrets and a read-only token in GitHub Actions, so their CI review ends in `error`.
 - Tested on macOS. Windows is untested: hooks call `python3`, and there's no state lock (no `fcntl`).
 - `/security-review` needs `origin/HEAD`; without a remote, preflight runs the security pass in a fresh subagent.
 - Eval recall counts any `file:line` the review cites near the recorded bug; noise counts every cited location.
