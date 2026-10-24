@@ -37,7 +37,12 @@ Package.swift / *.xcodeproj, Makefile, existing CI workflows) and write the conf
 - `max_rounds` (default 3): review rounds before preflight stops and asks to rethink the approach.
 - `review_effort`: `/code-review` effort per tier (default low/medium/high). Raise `high` to `xhigh` or `max`
   only for a repo where one missed bug costs more than a long, expensive review.
-- `base`: the branch PRs target, when it isn't `origin/HEAD`, `main` or `master`.
+- `base`: the branch PRs target, when it isn't `origin/HEAD`, `main` or `master`. Without a base land-it refuses
+  to rate risk or stamp, rather than guess.
+- `required_stages`: review stages the stamp requires per tier (default low `code`; medium `code`, `security`;
+  high `code`, `security`, `verify`). Loosen only with a reason the user agrees to.
+- Checks must not modify files: a check that formats or generates code changes the tree under itself and won't
+  count as green. Put formatters in `on_edit`, or use their check mode (`prettier --check`, `ruff format --check`).
 - `circuit_breaker` (on by default: `{"revert_rate": 0.05, "days": 14, "min_commits": 20}`): while reverts on
   the base branch are above the rate, every change's floor is one tier higher. `false` turns it off.
 

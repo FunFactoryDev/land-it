@@ -15,7 +15,8 @@ finding counts, the commands. "Tests pass" without output is not a step done.
 
 ## 1. Risk tier
 
-`land-it risk` gives the floor from the changed paths. Read the diff and **raise** the tier (never lower it)
+`land-it risk` gives the floor from the changed paths. If it says it can't find the base branch, stop and ask
+which branch the PR targets (then set `"base"` in `.claude/land-it.json`): an unknown base is not an empty diff. Read the diff and **raise** the tier (never lower it)
 when the content is riskier than its path: auth, permissions, billing, data migrations or deletes, concurrency,
 crypto, secrets, public API contracts, installers and auto-updaters, system prompts → high. Tell the user
 the tier and the reason in one line. If `circuit_breaker.tripped` is true, the floor is already one tier
@@ -27,7 +28,8 @@ higher because reverts on the base branch are above the threshold: say so, with 
 - `over_cap: true` → **stop reviewing.** Run `land-it findings`, group what keeps coming back by class, and tell
   the user the reviewer isn't converging: the approach likely needs rethinking. Ask before going on. After
   the approach changes, `land-it round --reset` starts over.
-- `already_reviewed: true` → this exact tree was reviewed in the previous round: skip steps 4–7.
+- `reviewed: true` → this exact tree's code review already finished in this round (see `stages`): skip the
+  review runs in step 4, keep steps 5–8. A round that only started proves nothing, so `reviewed` stays false.
 - `target` → pass it to the review in step 5. Empty in round 1 (whole change); from round 2 it's a range
   of two snapshots, so the review sees only what changed since the last round.
 
@@ -36,6 +38,8 @@ higher because reverts on the base branch are above the threshold: say so, with 
 `land-it check`. If it says the commands aren't trusted, stop: show the user the commands and ask them to
 type `/land-it:trust`. Red → fix the cause, re-run, repeat. Never edit a test or a check to make it pass
 unless the test is wrong, and then say so. Stop and ask after three failed attempts at the same failure.
+If it says the checks changed files, a check is formatting or generating code: look at the change, keep it if
+it's right, and run `land-it check` again. A tree is green only when the checks passed without touching it.
 
 ## 4. Depth by tier
 
@@ -51,11 +55,22 @@ tell the user that `/code-review max` locally or `/code-review ultra` in the clo
 is available if one missed bug would cost more than that.
 
 Run the steps in this order, through the Skill tool: `simplify` (then `land-it check` again),
-`code-review`, `security-review`, `verify`. `code-review` follows CLAUDE.md, which imports REVIEW.md. If a skill
-is unavailable or fails (`security-review` needs `origin/HEAD`, so it fails in a repo without a remote), don't
-substitute your own read of the code: spawn a general-purpose subagent with only the diff (`git diff <merge base>`)
-and REVIEW.md, none of your reasoning, ask it for findings with `file:line` evidence, and say in the PR body
-which step ran this way.
+`code-review`, `security-review`, `verify`. `code-review` follows CLAUDE.md, which imports REVIEW.md.
+
+**Record each stage when it has actually run**, with its real outcome:
+`land-it stage code --status completed --effort <effort>`, and the same for `simplify`, `security`, `verify`.
+A stage that didn't run is `--status skipped` or `--status not_run` with `--reason "…"`. The stamp requires, per
+tier: low `code`; medium `code` and `security`; high `code`, `security` and `verify`. Only `verify` may be
+`not_run` (with a reason, e.g. a library with nothing to launch); every other required stage must have completed.
+Never record `completed` for a review that errored, timed out or was cut short.
+
+If a review skill is unavailable or fails (`security-review` needs `origin/HEAD`, so it fails in a repo without a
+remote), don't substitute your own read of the code: spawn a general-purpose subagent with only the diff
+(`git diff <merge base>`) and REVIEW.md, none of your reasoning, ask it for findings with `file:line` evidence,
+record the stage as completed only when it returned, and say in the PR body which step ran this way. That
+fallback is for **code and security review only**. A behavior check means running the thing: tests of the
+changed path, the CLI, the app. Reading the diff is not a behavior check; if nothing can run, record
+`verify --status not_run --reason "…"`.
 
 ## 5. Findings ledger: every finding gets an answer
 
@@ -64,19 +79,25 @@ which step ran this way.
 2. Record the rest, security findings included:
    `land-it findings add` with JSON on stdin:
    `[{"file": "src/a.py", "line": 42, "summary": "…", "severity": "important"}]` (`important` or `nit`).
-   The script marks a finding `pre-existing` when blame puts the line on the base branch.
+   Each finding comes back with a blame hint, `introduced`: `before` (the line is already on the base),
+   `this-change` or `unknown`. It's a hint about the line's age, not a verdict: an old line can become a bug
+   because this change now calls it with new input.
 3. Answer each `open` one:
    - fix it, then `land-it findings resolve F3 --status fixed`. If it's a class of bug, grep for every
      instance and fix them all.
    - or `land-it findings resolve F3 --status wontfix --reason "…"` (intended behavior, false positive with evidence).
-   - `pre-existing`: don't fix in this change; it goes into the PR body as a follow-up.
+   - or, when the defect really predates this change, `--status pre-existing --reason "…"`: say why, e.g. the
+     same failure reproduces on the base, or nothing this change touches reaches the line. Don't fix it here;
+     it goes into the PR body as a follow-up.
 4. Nits: at most 3, and none while any Important finding is open.
 
-`stamp` refuses while any finding is `open`.
+`stamp` refuses while any finding is `open`, and `wontfix` / `pre-existing` need a reason.
 
 ## 6. Final checks and stamp
 
 After the last edit: `land-it check` (green on the final tree), then `land-it stamp --tier <tier from step 1>`.
+It refuses until the tier's stages are recorded. Its output says `changed_after_review` when the tree moved after
+the review (the fixes): name those fixes in the PR body.
 The stamp binds the exact tree that passed: Claude's `gh pr create` is allowed only when HEAD's tree is that
 tree. Untracked files count: commit them, gitignore them, or delete them before stamping.
 

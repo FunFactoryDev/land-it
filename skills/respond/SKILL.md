@@ -31,7 +31,9 @@ A thread that repeats a recorded finding takes that finding's answer; don't reco
 - **Real bug, introduced by this PR**: fix it (every instance, if it's a class of bug), then
   `land-it findings resolve F… --status fixed`.
 - **Not a bug, or intended**: `--status wontfix --reason "…"` with evidence (a test, a doc, the code path).
-- **Pre-existing** (the ledger tagged it from blame): not this PR's job; say so and offer a follow-up issue.
+- **Pre-existing**: the ledger's `introduced: before` is a hint from blame, not proof. If the defect really
+  predates this PR (it reproduces on the base, or this PR doesn't reach the line), resolve it with
+  `--status pre-existing --reason "…"` and offer a follow-up issue; otherwise it's this PR's to fix.
 - **A person's question** (`bot: false`) may need an answer rather than a code change. Answer it.
 
 ## 4. Verify

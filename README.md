@@ -76,7 +76,7 @@ flowchart TD
 | Review the diff in a fresh context; bug hunt, simplify, end-to-end check | **`/land-it:preflight`**: checks → `/simplify` → `/code-review` → `/security-review` → `/verify`, in that order |
 | `REVIEW.md` written by code owners: what failure looks like, a nit cap, paths to skip, file:line evidence | **`/land-it:init`** writes one for the repo and imports it from CLAUDE.md |
 | Every finding must be answered on the PR: fix it, or resolve the thread with a reason | **`/land-it:respond`**: unresolved threads on the PR (Code Review, the CI workflow, Copilot, people) go into the ledger, get fixed or a reasoned won't-fix, and are replied to and resolved after you confirm |
-| Every finding gets an answer; Pre-existing bugs aren't blamed on the author | **Findings ledger.** Each finding is fixed, won't fix (a reason is required) or pre-existing (from `git blame` against the base). The stamp refuses while any finding is open |
+| Every finding gets an answer; Pre-existing bugs aren't blamed on the author | **Findings ledger.** Each finding is fixed, won't fix or pre-existing; the last two need a reason. `git blame` adds a hint (`introduced: before / this-change`), never the verdict: an old line can break because of new code. The stamp refuses while any finding is open |
 | The change sets the risk tier; a classifier, plus owner-listed sensitive paths and CI files | **Risk tiers** from paths: CI workflows, CODEOWNERS and land-it's own config are always high, docs are low. Claude may raise a tier from the content, never lower it |
 | Quick / Standard / Deep review per repo | **`review_effort`**: `/code-review` effort per tier, default low / medium / high |
 | Round cap, diff-only re-review, no repeated findings | **Review rounds.** From round 2 the review sees only the range since the previous round's snapshot; recorded findings aren't posted again; past `max_rounds` preflight stops and asks to rethink the approach |
@@ -136,6 +136,15 @@ Requirements: git, Python 3.9+ (stdlib only, nothing to install), a recent Claud
 | medium | yes | `review_effort.medium` (medium) | yes | if runtime behavior changes | one person reads the PR |
 | high | yes | `review_effort.high` (high) | yes | yes | a person reads every high-tier file; `/code-review max` or `ultra` on request |
 
+## What the stamp proves, and what it doesn't
+
+| | |
+|---|---|
+| **Enforced by land-it** | The checks passed on exactly this tree without changing it, and their last run on it didn't fail. The tier's review stages are recorded for this round (low: code; medium: + security; high: + verify, which may be `not_run` with a reason). Every finding has an answer, with a reason unless fixed. The tier isn't below what the paths and the circuit breaker require, and the base branch was known. |
+| **Rests on the agent following the skill** | That a recorded stage really ran and what it found. The record is local; land-it can't check a review's content. |
+| **Enforced only by GitHub, if you set it up** | That the PR on GitHub holds this tree, that review ran on each pushed commit, who may merge. The hooks mirror these rules for Claude's commands; branch protection and required checks are what make them hold. |
+| **Not there yet** | A tamper-proof, server-issued receipt and per-commit review status in CI (planned). |
+
 ## Hooks
 
 | Event | What land-it does |
@@ -174,7 +183,8 @@ Requirements: git, Python 3.9+ (stdlib only, nothing to install), a recent Claud
 | `risk` | `high` / `medium` / `low` globs. Unlisted paths are medium. Defaults: `*.md`, `docs/**`, `LICENSE*` low; `CLAUDE.md`, `REVIEW.md`, `.claude/**` medium; CI workflows, CODEOWNERS and this file always high |
 | `max_rounds` | Review rounds before preflight stops and asks to rethink the approach (default 3) |
 | `review_effort` | `/code-review` effort per tier. `max` is the deepest local pass, but it fans out to dozens of agents and can take most of an hour even on a small diff |
-| `base` | The branch PRs target, if it isn't `origin/HEAD`, `main` or `master` |
+| `base` | The branch PRs target, if it isn't `origin/HEAD`, `main` or `master`. Without a known base, `risk` and `stamp` refuse rather than guess |
+| `required_stages` | Review stages the stamp requires per tier. Default `{"low": ["code"], "medium": ["code", "security"], "high": ["code", "security", "verify"]}` |
 | `circuit_breaker` | On by default: `{"revert_rate": 0.05, "days": 14, "min_commits": 20}`. While reverts among first-parent commits on the base branch are above the rate, every change's floor is one tier higher. `false` turns it off |
 
 Globs follow gitignore rules: `*` stays inside a path segment, `**` crosses segments, `{a,b}` alternates, a pattern
@@ -205,7 +215,7 @@ each case in a throwaway worktree, copies in today's CLAUDE.md, REVIEW.md and la
 - **noise**: findings per known-good case;
 - **verdict** against the previous full run: keep a change only if recall rises, or holds with less noise.
 
-`--judge haiku` swaps the citation match for an LLM judge that reads each review and decides whether the recorded defect is reported, even if it's worded differently or cited elsewhere; it's more accurate for one small extra call per case, and runs with different scorers aren't compared. `--only` iterates on one case without recording. `--reviewer "<cmd with {range}>"` scores another reviewer, such as
+`--judge haiku` swaps the citation match for an LLM judge that reads each review and decides whether the recorded defect is reported, even if it's worded differently or cited elsewhere; it costs one small extra call per case. Its agreement with human judgment isn't measured, so treat keep/revert as a recommendation; runs with different scorers or an edited case set aren't compared, and a run where a case failed exits 2. Raw reviewer output for each case is kept in `.git/land-it/eval-runs/`. `--only` iterates on one case without recording. `--reviewer "<cmd with {range}>"` scores another reviewer, such as
 your own skill. `--model` and `--effort` compare models and depths.
 
 ## Cost in tokens and time
@@ -239,8 +249,9 @@ The plugin puts `land-it` on Claude's PATH; the skills call it. You can call it 
 | `land-it check` | Run the checks (path-scoped ones when the change touches them), print the output; on success mark the tree green |
 | `land-it risk` | Tier of the change against the merge base, per file, plus the review effort per tier |
 | `land-it round [--reset]` | Start a review round: number, cap, and the snapshot range for a diff-only re-review |
-| `land-it findings [add \| resolve ID --status S --reason R]` | The branch's findings ledger; `add` takes JSON on stdin and tags pre-existing lines |
-| `land-it stamp [--tier T]` | Bind the green tree and its tier; refuses on open findings or a tier below the path floor |
+| `land-it findings [add \| resolve ID --status S --reason R]` | The branch's findings ledger; `add` takes JSON on stdin and adds a blame hint to each finding |
+| `land-it stage KIND --status S [--reason R]` | Record that a review stage of the current round ran (`completed`) or why it didn't (`skipped`, `not_run`) |
+| `land-it stamp [--tier T]` | Bind the green tree and its tier; refuses on open findings, missing review stages, an unknown base or a tier below the floor |
 | `land-it status` | Trust, green and stamp state for the worktree and HEAD |
 | `land-it trust` | Approve the config's commands, at your own terminal |
 | `land-it eval [list \| scan \| add … \| run …]` | Reviewer evals; `scan` finds reverts that aren't cases yet |

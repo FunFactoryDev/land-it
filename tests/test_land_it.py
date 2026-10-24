@@ -39,6 +39,12 @@ class Repo:
     def trust(self):
         return self.hook("expand", command_name="land-it:trust")
 
+    def review(self, *kinds):
+        """What preflight records after its reviews ran: a round with completed stages."""
+        self.cli("round")
+        for kind in kinds or ("code", "security", "verify"):
+            self.cli("stage", kind, "--status", "completed")
+
     def write(self, rel, text):
         path = os.path.join(self.root, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -98,6 +104,7 @@ class Gate(unittest.TestCase):
         r = Repo(self, {"checks": {"ok": "true"}})
         self.assertEqual(r.pr_create(), "deny")
         self.assertEqual(r.cli("check").returncode, 0)
+        r.review()
         self.assertEqual(r.cli("stamp").returncode, 0, "clean tree = HEAD tree")
         self.assertIsNone(r.pr_create())
         r.write("a.py", "x = 2\n")
@@ -113,6 +120,7 @@ class Gate(unittest.TestCase):
         r = Repo(self, {"checks": {"ok": "true"}})
         r.write("b.py", "y = 1\n")
         r.cli("check")
+        r.review()
         self.assertEqual(r.cli("stamp").returncode, 0)
         self.assertEqual(r.pr_create(), "deny", "stamped content isn't committed yet")
         r.commit("commit the stamped tree")
@@ -201,7 +209,9 @@ class Rounds(unittest.TestCase):
         branch(r)
         first = json.loads(r.cli("round").stdout)
         self.assertEqual((first["round"], first["target"], first["over_cap"]), (1, "", False))
-        self.assertTrue(json.loads(r.cli("round").stdout)["already_reviewed"], "same tree, same round")
+        self.assertFalse(json.loads(r.cli("round").stdout)["reviewed"], "a started round isn't a finished review")
+        r.cli("stage", "code", "--status", "completed")
+        self.assertTrue(json.loads(r.cli("round").stdout)["reviewed"], "same tree, review recorded")
         r.write("a.py", "x = 'fixed'\n")
         second = json.loads(r.cli("round").stdout)
         self.assertEqual(second["round"], 2)
@@ -222,14 +232,18 @@ class Findings(unittest.TestCase):
         found = [{"file": "a.py", "line": 1, "summary": "x is wrong"},
                  {"file": os.path.join(r.root, "a.py"), "line": "2", "summary": "y is wrong"}]
         added = json.loads(r.cli("findings", "add", stdin=json.dumps(found)).stdout)
-        self.assertEqual([(f["id"], f["status"]) for f in added], [("F1", "pre-existing"), ("F2", "open")])
+        self.assertEqual([(f["id"], f["status"], f["introduced"]) for f in added],
+                         [("F1", "open", "before"), ("F2", "open", "this-change")], "blame hints, never decides")
         again = json.loads(r.cli("findings", "add", stdin=json.dumps(found[1:])).stdout)
         self.assertEqual(again, [], "a finding is never posted twice")
         r.cli("check")
+        r.review()
         refused = r.cli("stamp")
         self.assertNotEqual(refused.returncode, 0)
-        self.assertIn("F2", refused.stderr)
-        self.assertNotEqual(r.cli("findings", "resolve", "F2", "--status", "wontfix").returncode, 0, "needs a reason")
+        self.assertIn("F1, F2", refused.stderr)
+        for status in ("wontfix", "pre-existing"):
+            self.assertNotEqual(r.cli("findings", "resolve", "F2", "--status", status).returncode, 0, "needs a reason")
+        r.cli("findings", "resolve", "F1", "--status", "pre-existing", "--reason", "same failure on main")
         self.assertEqual(r.cli("findings", "resolve", "F2", "--status", "wontfix", "--reason", "intended").returncode, 0)
         self.assertEqual(r.cli("stamp").returncode, 0)
 
@@ -238,6 +252,7 @@ class Findings(unittest.TestCase):
         branch(r)
         r.write(".github/workflows/ci.yml", "on: push\n")
         r.cli("check")
+        r.review()
         self.assertNotEqual(r.cli("stamp", "--tier", "low").returncode, 0)
         self.assertEqual(json.loads(r.cli("stamp", "--tier", "high").stdout)["tier"], "high")
 
@@ -253,12 +268,14 @@ class MergeGate(unittest.TestCase):
         r.write("docs/a.md", "x\n")
         r.commit("docs")
         r.cli("check")
+        r.review()
         r.cli("stamp")
         self.assertIsNone(self.merge(r, "gh pr merge --squash --delete-branch"))
         self.assertEqual(self.merge(r, "gh pr merge 12 --squash"), "ask", "another PR: can't vouch for it")
         r.write("src/a.py", "x\n")
         r.commit("code")
         r.cli("check")
+        r.review()
         r.cli("stamp")
         self.assertEqual(self.merge(r, "gh pr merge --squash"), "ask", "medium needs a person")
 
@@ -296,9 +313,9 @@ class Evals(unittest.TestCase):
         return ("grep -q RULE-X REVIEW.md || exit 3; case {range} in *%s) echo '%s';; *) echo '%s';; esac"
                 % (self.bug, on_bug, on_clean))
 
-    def run_eval(self, *args):
+    def run_eval(self, *args, code=0):
         out = self.r.cli("eval", "run", *args)
-        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.returncode, code, out.stderr)
         return out.stdout
 
     def test_scores_and_verdicts(self):
@@ -314,7 +331,7 @@ class Evals(unittest.TestCase):
     def test_only_is_not_recorded_and_errors_block_comparison(self):
         self.assertIn("not recorded", self.run_eval("--reviewer", self.stub("a.py:2"), "--only", "clean1"))
         self.assertFalse(os.path.exists(os.path.join(self.r.root, LI.EVAL_DIR, "history.jsonl")))
-        self.assertIn("failed to run", self.run_eval("--reviewer", "exit 1"))
+        self.assertIn("failed to run", self.run_eval("--reviewer", "exit 1", code=2))
 
     def test_judge_scores_the_defect_not_the_citation(self):
         reviewer = self.stub("the y default is wrong (no file:line given)")
@@ -324,7 +341,10 @@ class Evals(unittest.TestCase):
         self.assertIn('"recall": 1.0', out)
         self.assertIn('"noise": 2.0', out)
         self.assertIn("scorer changed", self.run_eval("--reviewer", reviewer))
-        self.assertIn("failed to run", self.run_eval("--reviewer", reviewer, "--judge-cmd", "echo no json"))
+        self.assertIn("failed to run", self.run_eval("--reviewer", reviewer, "--judge-cmd", "echo no json", code=2))
+        for bad in ("echo '{\"caught\": 1, \"findings\": 1}'; exit 3", "echo '{\"caught\": -1, \"findings\": 0}'",
+                    "echo '{\"caught\": 5, \"findings\": 5}'"):
+            self.assertIn("failed to run", self.run_eval("--reviewer", reviewer, "--judge-cmd", bad, code=2), bad)
 
     def test_bug_case_needs_location(self):
         self.assertNotEqual(self.r.cli("eval", "add", "--commit", self.bug).returncode, 0)
@@ -333,17 +353,17 @@ class Evals(unittest.TestCase):
 
 class Trust(unittest.TestCase):
     def test_untrusted_commands_never_run(self):
-        r = Repo(self, {"checks": {"t": "touch RAN"}, "on_edit": {"*.py": "touch RAN2"}}, trust=False)
+        r = Repo(self, {"checks": {"t": "touch .git/RAN"}, "on_edit": {"*.py": "touch .git/RAN2"}}, trust=False)
         refused = r.cli("check")
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("/land-it:trust", refused.stderr)
         self.assertIn("/land-it:trust", r.edit("a.py", "x = 2\n")["systemMessage"])
         self.assertIsNone(r.edit("a.py", "x = 3\n"), "warned once per session")
         self.assertIn("/land-it:trust", r.hook("stop")["systemMessage"])
-        self.assertFalse(os.path.exists(os.path.join(r.root, "RAN")) or os.path.exists(os.path.join(r.root, "RAN2")))
+        self.assertFalse(os.path.exists(os.path.join(r.root, ".git/RAN")) or os.path.exists(os.path.join(r.root, ".git/RAN2")))
         r.trust()
         self.assertEqual(r.cli("check").returncode, 0)
-        self.assertTrue(os.path.exists(os.path.join(r.root, "RAN")))
+        self.assertTrue(os.path.exists(os.path.join(r.root, ".git/RAN")))
 
     def test_trust_follows_commands_not_other_keys(self):
         r = Repo(self, {"checks": {"t": "true"}})
@@ -424,6 +444,8 @@ class Measure(unittest.TestCase):
         r.cli("findings", "add", stdin=json.dumps([{"file": "src/a.py", "line": 1, "summary": "bug"}]))
         r.cli("findings", "resolve", "F1", "--status", "fixed")
         r.cli("check")
+        r.cli("stage", "code", "--status", "completed")
+        r.cli("stage", "security", "--status", "completed")
         self.assertEqual(r.cli("stamp").returncode, 0)
         r.cli("stamp")  # a re-stamp of the same change counts once
         r.commit("one")
@@ -432,6 +454,8 @@ class Measure(unittest.TestCase):
         r.cli("round")
         r.write("src/b.py", "b2\n")
         r.cli("round")
+        r.cli("stage", "code", "--status", "completed")
+        r.cli("stage", "security", "--status", "completed")
         r.cli("check")
         r.cli("stamp")
         out = json.loads(r.cli("stats").stdout)
@@ -462,7 +486,7 @@ class Measure(unittest.TestCase):
         self.assertEqual(gh["merged_without_approval_pct"], 50, "the Claude app's approval doesn't count")
         self.assertEqual(gh["human_comments_per_pr"]["p95"], 1)
         self.assertEqual(gh["revert_prs_pct"], 50)
-        self.assertEqual(gh["hours_to_merge"]["median"], 10.0)
+        self.assertEqual(gh["hours_to_merge"]["median"], 6.0, "an even sample's median is the mean of the middle two")
 
 
 
@@ -667,6 +691,96 @@ class AuditRegressions(unittest.TestCase):
         with open(os.path.join(os.path.dirname(os.path.dirname(BIN)), "hooks", "hooks.json")) as f:
             pre = json.load(f)["hooks"]["PreToolUse"][0]["hooks"][0]
         self.assertEqual(pre.get("onFailure"), "block")
+
+
+
+class Guarantees(unittest.TestCase):
+    """0.7.0: the stamp means what the README says. Reproductions from the audit, one per finding."""
+
+    def test_r01_r02_no_stamp_without_the_tiers_review_stages(self):
+        r = Repo(self, {"checks": {"ok": "true"}})
+        branch(r)
+        r.write("src/a.py", "x\n")
+        r.cli("check")
+        out = r.cli("stamp")
+        self.assertIn("code, security", out.stderr, "green checks alone don't make a reviewed change")
+        r.cli("round")
+        self.assertNotEqual(r.cli("stage", "security", "--status", "skipped").returncode, 0, "skipping needs a reason")
+        r.cli("stage", "code", "--status", "completed")
+        r.cli("stage", "security", "--status", "skipped", "--reason", "no input handling")
+        self.assertIn("security", r.cli("stamp").stderr, "a required stage must have run")
+        r.cli("stage", "security", "--status", "completed")
+        self.assertEqual(r.cli("stamp").returncode, 0)
+
+    def test_verify_may_be_not_run_with_a_reason(self):
+        r = Repo(self, {"checks": {"ok": "true"}, "risk": {"high": ["src/**"]}})
+        branch(r)
+        r.write("src/a.py", "x\n")
+        r.cli("check")
+        r.review("code", "security")
+        r.cli("stage", "verify", "--status", "not_run", "--reason", "library, nothing to launch")
+        self.assertEqual(r.cli("stamp").returncode, 0)
+
+    def test_r03_a_red_run_clears_green_and_the_stamp(self):
+        r = Repo(self, {"checks": {"t": "test ! -f .git/FAIL"}})
+        r.cli("check")
+        r.review()
+        self.assertEqual(r.cli("stamp").returncode, 0)
+        open(os.path.join(r.root, ".git/FAIL"), "w").close()
+        self.assertEqual(r.cli("check").returncode, 1)
+        self.assertNotEqual(r.cli("stamp").returncode, 0, "same tree, but its last check failed")
+        self.assertEqual(r.pr_create(), "deny", "the earlier stamp went with it")
+
+    def test_r04_checks_that_change_the_tree_dont_vouch_for_it(self):
+        r = Repo(self, {"checks": {"fmt": "echo 'x = 9' > a.py"}})
+        out = r.cli("check")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("changed files", out.stdout)
+        self.assertFalse(json.loads(r.cli("status").stdout)["checks_green_for_worktree"])
+        self.assertEqual(r.cli("check").returncode, 0, "stable on the second run")
+
+    def test_r07_unknown_base_is_an_error_not_a_low_risk_diff(self):
+        r = Repo(self, {"risk": {"high": ["src/auth/**"]}})
+        sh(r.root, "git", "branch", "-m", "trunk")
+        branch(r)
+        r.write("src/auth/key.py", "k\n")
+        r.commit("auth")
+        out = r.cli("risk")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn('set "base"', out.stderr)
+        self.assertNotEqual(r.cli("stamp").returncode, 0)
+        r.write(".claude/land-it.json", json.dumps({"risk": {"high": ["src/auth/**"]}, "base": "trunk"}))
+        self.assertEqual(json.loads(r.cli("risk").stdout)["tier"], "high")
+
+    def test_r08_renames_and_unicode_keep_their_risk(self):
+        r = Repo(self, {"risk": {"high": ["src/auth/**"]}})
+        r.write("src/auth/access.py", "a\n")
+        r.commit("auth")
+        branch(r)
+        os.makedirs(os.path.join(r.root, "docs"))
+        sh(r.root, "git", "mv", "src/auth/access.py", "docs/access.md")
+        r.commit("move it to docs")
+        out = json.loads(r.cli("risk").stdout)
+        self.assertEqual(out["tier"], "high", "moving a file out of a high-risk area is a high-risk change")
+        r.write("src/auth/пароль.py", "p\n")
+        self.assertEqual(json.loads(r.cli("risk").stdout)["files"].get("src/auth/пароль.py"), "high")
+
+    def test_a_broken_config_is_a_clear_error(self):
+        r = Repo(self, {})
+        r.write(".claude/land-it.json", '{"checks": {"t": "true"')
+        out = r.cli("risk")
+        self.assertIn("isn't valid JSON", out.stderr)
+        self.assertNotIn("Traceback", out.stderr)
+
+    def test_e03_an_edited_case_is_a_new_baseline(self):
+        r = Repo(self, {})
+        r.write("a.py", "x = 1\ny = None\n")
+        r.commit("bug")
+        bug = sh(r.root, "git", "rev-parse", "HEAD").strip()
+        r.cli("eval", "add", "--commit", bug, "--file", "a.py", "--line", "2", "--summary", "y is None", "--id", "c1")
+        self.assertIn("baseline", r.cli("eval", "run", "--reviewer", "echo a.py:2").stdout)
+        r.cli("eval", "add", "--commit", bug, "--file", "a.py", "--line", "1", "--summary", "x too", "--id", "c1")
+        self.assertIn("case set changed", r.cli("eval", "run", "--reviewer", "echo a.py:2").stdout)
 
 
 if __name__ == "__main__":

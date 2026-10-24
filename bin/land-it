@@ -35,11 +35,29 @@ def die(msg):
     sys.exit("land-it: " + msg)
 
 
-def git(root, *args, env=None, check=True):
+def git(root, *args, env=None, check=True, raw=False):
     r = subprocess.run(["git", *args], cwd=root, env=env, capture_output=True, text=True)
     if check and r.returncode:
         die("git %s: %s" % (" ".join(args), r.stderr.strip()))
-    return r.stdout.strip() if r.returncode == 0 else ""
+    return (r.stdout if raw else r.stdout.strip()) if r.returncode == 0 else ""
+
+
+def nul_paths(out, status=False):
+    """Paths from git's -z output: no quoting, so Unicode and odd names survive. With --name-status,
+    a rename or copy yields both paths, so moving a file out of a high-risk area still counts the area."""
+    toks, paths, i = out.split("\0"), [], 0
+    while i < len(toks) and toks[i]:
+        n = 1
+        if status:
+            n = 2 if toks[i][:1] in "RC" else 1
+            i += 1
+        paths += toks[i:i + n]
+        i += n
+    return paths
+
+
+def diff_paths(root, *revs):
+    return nul_paths(git(root, "diff", "--name-status", "-z", "-M", *revs, check=False, raw=True), status=True)
 
 
 def find_root(cwd):
@@ -52,7 +70,13 @@ def load_config(root):
     if not os.path.exists(path):
         return None
     with open(path) as f:
-        return json.load(f)
+        try:
+            cfg = json.load(f)
+        except ValueError as e:
+            die("%s isn't valid JSON: %s" % (CONFIG, e))
+    if not isinstance(cfg, dict):
+        die("%s must be a JSON object" % CONFIG)
+    return cfg
 
 
 def tail(text, n=TAIL):
@@ -256,7 +280,7 @@ def breaker(root, cfg):
 
 
 def floor_tier(root, cfg):
-    tier, per = classify(changed_files(root, cfg), cfg)
+    tier, per = classify(changed_files_or_die(root, cfg), cfg)
     b = breaker(root, cfg)
     if b and b["tripped"] and per:
         tier = TIERS[min(TIERS.index(tier) + 1, len(TIERS) - 1)]
@@ -264,10 +288,21 @@ def floor_tier(root, cfg):
 
 
 def changed_files(root, cfg):
-    """Files that differ from the merge base, uncommitted and untracked included."""
-    tracked = git(root, "diff", "--name-only", merge_base(root, cfg) or "HEAD", check=False)
-    untracked = git(root, "ls-files", "--others", "--exclude-standard", check=False)
-    return sorted(set(filter(None, (tracked + "\n" + untracked).splitlines())))
+    """Files that differ from the merge base, uncommitted and untracked included. None when there's no base:
+    a diff that can't be computed must never read as an empty, low-risk one."""
+    base = merge_base(root, cfg)
+    if not base:
+        return None
+    untracked = nul_paths(git(root, "ls-files", "-z", "--others", "--exclude-standard", check=False, raw=True))
+    return sorted(set(diff_paths(root, base) + untracked))
+
+
+def changed_files_or_die(root, cfg):
+    files = changed_files(root, cfg)
+    if files is None:
+        die("can't find the base branch to compare with (tried %s); set \"base\" in %s"
+            % (cfg.get("base") or "origin/HEAD, main, master", CONFIG))
+    return files
 
 
 def cmd_risk(root, cfg, a):
@@ -281,6 +316,28 @@ def cmd_risk(root, cfg, a):
 def ledger_name(root):
     branch = git(root, "rev-parse", "--abbrev-ref", "HEAD", check=False) or "unborn"
     return "ledger-%s.json" % re.sub(r"[^\w.-]", "_", branch)
+
+
+STAGES = ["simplify", "code", "security", "verify"]
+REQUIRED_STAGES = {"low": ["code"], "medium": ["code", "security"], "high": ["code", "security", "verify"]}
+
+
+def stage_done(kind, rec):
+    """A required stage must have completed; verify may also be not_run with a reason (nothing runnable)."""
+    return bool(rec) and (rec["status"] == "completed" or (kind == "verify" and rec["status"] == "not_run"
+                                                          and bool(rec.get("reason"))))
+
+
+def cmd_stage(root, cfg, a):
+    if a.status != "completed" and not a.reason:
+        die("--status %s needs --reason" % a.status)
+    with locked_state(root, ledger_name(root)) as led:
+        rounds = led.get("rounds") or []
+        if not rounds:
+            die("no review round yet; run `land-it round` first")
+        rounds[-1].setdefault("stages", {})[a.kind] = {"status": a.status, "reason": a.reason or "", "effort": a.effort,
+                                                        "tree": worktree_tree(root), "at": int(time.time())}
+    print(json.dumps({"round": rounds[-1]["n"], "stages": rounds[-1]["stages"]}, indent=1))
 
 
 def cmd_round(root, cfg, a):
@@ -302,22 +359,28 @@ def cmd_round(root, cfg, a):
         "round": cur["n"],
         "max_rounds": cap,
         "over_cap": cur["n"] > cap,
-        "already_reviewed": not fresh,
+        # true only when this exact tree's code review finished: a started round proves nothing
+        "reviewed": not fresh and stage_done("code", (cur.get("stages") or {}).get("code")),
+        "stages": cur.get("stages") or {},
         # round 1 reviews the whole change; later rounds only what changed since the previous one
         "target": "%s..%s" % (prev["snap"], cur["snap"]) if prev else "",
     }, indent=1))
 
 
-def introduced_before(root, path, line, base):
-    """True when blame puts the line in a commit already on the base: a pre-existing bug."""
+def introduced(root, path, line, base):
+    """Blame's hint for a finding: "before" (the line is already on the base), "this-change", or "unknown".
+    Only a hint: an old line can become a bug because of new code that now reaches it."""
     m = re.match(r"\d+", str(line or ""))
     if not (base and m):
-        return False
+        return "unknown"
     out = git(root, "blame", "--porcelain", "-L", "%s,%s" % (m.group(), m.group()), "--", path, check=False)
     sha = out.split(" ", 1)[0]
-    if not sha or set(sha) == {"0"}:
-        return False
-    return subprocess.run(["git", "merge-base", "--is-ancestor", sha, base], cwd=root).returncode == 0
+    if not sha:
+        return "unknown"
+    if set(sha) == {"0"}:
+        return "this-change"
+    old = subprocess.run(["git", "merge-base", "--is-ancestor", sha, base], cwd=root).returncode == 0
+    return "before" if old else "this-change"
 
 
 def cmd_findings(root, cfg, a):
@@ -335,7 +398,7 @@ def cmd_findings(root, cfg, a):
                 seen.add(key)
                 item = {"id": "F%d" % (len(fs) + 1), "round": len(led.get("rounds", [])) or 1, "file": path,
                         "line": f.get("line"), "summary": f["summary"], "severity": f.get("severity", "important"),
-                        "status": "pre-existing" if introduced_before(root, path, f.get("line"), base) else "open",
+                        "status": "open", "introduced": introduced(root, path, f.get("line"), base),
                         "reason": "", "thread": f.get("thread")}
                 fs.append(item)
                 added.append(item)
@@ -343,8 +406,8 @@ def cmd_findings(root, cfg, a):
     elif a.action == "resolve":
         if not (a.id and a.status):
             die("usage: land-it findings resolve F3 --status fixed|wontfix|pre-existing|open [--reason ...]")
-        if a.status == "wontfix" and not a.reason:
-            die("wontfix needs --reason")
+        if a.status in ("wontfix", "pre-existing") and not a.reason:
+            die("%s needs --reason (for pre-existing: why the defect isn't this change's)" % a.status)
         with locked_state(root, name) as led:
             item = next((x for x in led.get("findings", []) if x["id"] == a.id), None)
             if item is None:
@@ -391,14 +454,24 @@ def run_checks(root, cfg, only=None, files=None):
 def cmd_check(root, cfg, a):
     if not is_trusted(root, cfg):
         die(untrusted_message(cfg))
-    # checks skipped by `paths` don't apply to this change, so a pass still makes the tree green
+    before = worktree_tree(root)
+    # checks skipped by `paths` don't apply to this change (no base: run them all), so a pass still means green
     ok, _, log = run_checks(root, cfg, files=changed_files(root, cfg))
     print(log)
+    after = worktree_tree(root)
+    with locked_state(root) as st:
+        if ok and before == after:
+            st["green"] = after
+        else:  # a red run, or one that changed the tree under it, proves nothing about this tree
+            st.pop("green", None)
+            if (st.get("stamp") or {}).get("tree") in (before, after):
+                st.pop("stamp", None)
+    if ok and before != after:
+        print("== land-it: the checks changed files (a formatter or fixer among them, or an edit meanwhile); "
+              "look at the change and run check again")
+        sys.exit(1)
     if ok:
-        tree = worktree_tree(root)
-        with locked_state(root) as st:
-            st["green"] = tree
-        print("== land-it: all checks green for tree %s" % tree[:12])
+        print("== land-it: all checks green for tree %s" % after[:12])
     sys.exit(0 if ok else 1)
 
 
@@ -413,18 +486,27 @@ def cmd_stamp(root, cfg, a):
     fs, rounds = led.get("findings", []), led.get("rounds", [])
     unanswered = [x["id"] for x in fs if x["status"] == "open"]
     if unanswered:
-        die("unanswered findings %s: resolve each one (fixed, or wontfix --reason)" % ", ".join(unanswered))
+        die("unanswered findings %s: resolve each one (fixed, or wontfix / pre-existing --reason)" % ", ".join(unanswered))
+    required = dict(REQUIRED_STAGES, **(cfg.get("required_stages") or {})).get(tier, [])
+    stages = (rounds[-1].get("stages") or {}) if rounds else {}
+    missing = [k for k in required if not stage_done(k, stages.get(k))]
+    if missing:
+        die("a %s-tier change needs these review stages first: %s. Run each, then record it with "
+            "`land-it stage <kind> --status completed`" % (tier, ", ".join(missing)))
+    reviewed_tree = rounds[-1]["tree"] if rounds else None
     with locked_state(root) as st:
         if st.get("green") != tree:
             die("checks are not green for the current tree; run `land-it check` first")
-        st["stamp"] = {"tree": tree, "tier": tier, "at": now}
+        st["stamp"] = {"tree": tree, "tier": tier, "at": now, "base": merge_base(root, cfg),
+                       "reviewed_tree": reviewed_tree, "stages": stages}
     record_run(root, {
         "at": now, "branch": git(root, "rev-parse", "--abbrev-ref", "HEAD", check=False), "tier": tier,
         "rounds": len(rounds), "minutes": round((now - rounds[0]["at"]) / 60, 1) if rounds else None,
         "findings": {s: sum(x["status"] == s for x in fs) for s in ("fixed", "wontfix", "pre-existing")},
         "breaker": bool(b and b["tripped"]),
     })
-    print(json.dumps({"stamped": tree, "tier": tier, "pr_body": os.path.join(state_dir(root), "pr-body.md")}, indent=1))
+    print(json.dumps({"stamped": tree, "tier": tier, "changed_after_review": reviewed_tree != tree,
+                      "pr_body": os.path.join(state_dir(root), "pr-body.md")}, indent=1))
 
 
 # --- stats: the article's numbers for this repo ----------------------------------------
@@ -444,6 +526,12 @@ def record_run(root, rec):
 
 def pct(x, n):
     return round(100.0 * x / n) if n else None
+
+
+def median(xs):
+    xs = sorted(x for x in xs if x is not None)
+    mid = len(xs) // 2
+    return (xs[mid] if len(xs) % 2 else (xs[mid - 1] + xs[mid]) / 2) if xs else None
 
 
 def quantile(xs, q):
@@ -487,10 +575,10 @@ def github_stats(root, days):
     hours = [round((iso_ts(pr["mergedAt"]) - iso_ts(pr["createdAt"])) / 3600, 1) for pr in prs if pr.get("mergedAt")]
     return {
         "merged_prs": len(prs),
-        "approvals_per_pr": {"median": quantile(approvals, .5), "p95": quantile(approvals, .95)},
+        "approvals_per_pr": {"median": median(approvals), "p95": quantile(approvals, .95)},
         "merged_without_approval_pct": pct(sum(a == 0 for a in approvals), len(prs)),
-        "human_comments_per_pr": {"median": quantile(comments, .5), "p95": quantile(comments, .95)},
-        "hours_to_merge": {"median": quantile(hours, .5), "p95": quantile(hours, .95)},
+        "human_comments_per_pr": {"median": median(comments), "p95": quantile(comments, .95)},
+        "hours_to_merge": {"median": median(hours), "p95": quantile(hours, .95)},
         "revert_prs_pct": pct(sum(pr["title"].startswith("Revert") for pr in prs), len(prs)),
     }
 
@@ -515,7 +603,7 @@ def cmd_stats(root, cfg, a):
             "mean_rounds": round(sum(r["rounds"] for r in rs) / len(rs), 2) if rs else None,
             "hit_round_cap_pct": pct(sum(r["rounds"] > cap for r in rs), len(rs)),
             "tiers": {t: sum(r["tier"] == t for r in rs) for t in TIERS},
-            "median_minutes": quantile([r.get("minutes") for r in rs], .5),
+            "median_minutes": median([r.get("minutes") for r in rs]),
         },
         "findings": {"total": total, "fixed_pct": pct(found["fixed"], total), "wontfix_pct": pct(found["wontfix"], total),
                      "pre_existing_pct": pct(found["pre-existing"], total)},
@@ -645,6 +733,13 @@ REVIEW:
 >>>"""
 
 
+def scorer_id(a):
+    if not (a.judge or a.judge_cmd):
+        return "cites"
+    what = a.judge or "cmd:" + hashlib.sha1(a.judge_cmd.encode()).hexdigest()[:8]
+    return "judge:%s:%s" % (what, hashlib.sha1(JUDGE_PROMPT.encode()).hexdigest()[:6])
+
+
 def judge_score(case, text, a):
     """An LLM reads the review: the defect counts, not just a file:line citation near it."""
     known = "\n".join("  - %s lines %d-%d: %s" % (e["file"], e["lines"][0], e["lines"][1], e["summary"])
@@ -655,13 +750,17 @@ def judge_score(case, text, a):
     with tempfile.TemporaryDirectory() as empty:  # the judge reads the review, not the code
         try:
             r = subprocess.run(cmd, shell=shell, cwd=empty, input=prompt, capture_output=True, text=True, timeout=300)
+            if r.returncode:
+                raise ValueError("judge exited %d" % r.returncode)
             got = json.loads(re.findall(r"\{[^{}]*\}", r.stdout)[-1])
-            caught, findings = int(got["caught"]), int(got["findings"])
-        except (subprocess.TimeoutExpired, IndexError, ValueError, KeyError, TypeError):
-            return {"id": case["id"], "kind": case["kind"], "error": "judge gave no verdict"}
+            caught, findings = got["caught"], got["findings"]
+            if not all(type(n) is int and n >= 0 for n in (caught, findings)) or caught > len(case["expect"]):
+                raise ValueError("judge counts out of range")
+        except (subprocess.TimeoutExpired, IndexError, ValueError, KeyError, TypeError) as e:
+            return {"id": case["id"], "kind": case["kind"], "error": "judge gave no valid verdict (%s)" % e}
     res = {"id": case["id"], "kind": case["kind"], "findings": findings}
     if case["kind"] == "bug":
-        res.update(expected=len(case["expect"]), caught=min(caught, len(case["expect"])))
+        res.update(expected=len(case["expect"]), caught=caught)
     return res
 
 
@@ -672,13 +771,13 @@ def verdict(cur, prev):
         return "baseline recorded"
     if prev.get("scorer", "cites") != cur["scorer"]:
         return "scorer changed (%s -> %s): new baseline" % (prev.get("scorer", "cites"), cur["scorer"])
-    if sorted(prev["case_ids"]) != sorted(cur["case_ids"]) or prev["errors"]:
+    if prev.get("corpus", prev["case_ids"]) != cur["corpus"] or prev["errors"]:
         return "case set changed: new baseline, compare from the next run"
-    r0, r1, n0, n1 = prev["recall"] or 0, cur["recall"] or 0, prev["noise"] or 0, cur["noise"] or 0
+    r0, r1, n0, n1 = prev["recall"] or 0, cur["recall"] or 0, prev["noise"], cur["noise"]
     if r1 != r0:
         return ("better: recall %.0f%% -> %.0f%%, keep the change" if r1 > r0 else
                 "worse: recall %.0f%% -> %.0f%%, revert the reviewer change") % (r0 * 100, r1 * 100)
-    if n1 != n0:
+    if n0 is not None and n1 is not None and n1 != n0:
         return ("same recall, less noise (%.2f -> %.2f): keep the change" if n1 < n0 else
                 "same recall, more noise (%.2f -> %.2f): revert unless the extra findings are real") % (n0, n1)
     return "no change"
@@ -688,7 +787,8 @@ def eval_run(root, cfg, a):
     cases = [c for c in eval_cases(root) if not a.only or c["id"] in a.only]
     if not cases:
         die("no eval cases in %s; add one with `land-it eval add`" % EVAL_DIR)
-    results = []
+    results, raw_dir = [], os.path.join(state_dir(root), "eval-runs", time.strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(raw_dir, exist_ok=True)
     for c in cases:
         tmp = tempfile.mkdtemp(prefix="land-it-eval-")
         wt = os.path.join(tmp, "wt")
@@ -701,6 +801,8 @@ def eval_run(root, cfg, a):
         finally:
             git(root, "worktree", "remove", "--force", wt, check=False)
             shutil.rmtree(tmp, ignore_errors=True)
+        with open(os.path.join(raw_dir, c["id"] + ".txt"), "w") as f:  # to read why a case was missed
+            f.write(text)
         if code:
             res = {"id": c["id"], "kind": c["kind"], "error": tail(text, 300)}
         else:
@@ -719,15 +821,17 @@ def eval_run(root, cfg, a):
                 digest.update(rel.encode() + b"\0" + f.read())
     run = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "model": a.model or "default", "effort": a.effort,
            "reviewer": a.reviewer or "code-review", "guidance": digest.hexdigest()[:12],
-           "scorer": ("judge:" + (a.judge or "cmd")) if (a.judge or a.judge_cmd) else "cites",
+           "scorer": scorer_id(a),
+           # a case edited under the same id is a different corpus: fingerprint the content, not the ids
+           "corpus": hashlib.sha1(json.dumps(cases, sort_keys=True).encode()).hexdigest()[:12],
            "case_ids": [c["id"] for c in cases], "errors": sum("error" in r for r in results),
            "recall": round(sum(r["caught"] for r in bugs) / expected, 3) if expected else None,
            "noise": round(sum(r["findings"] for r in clean) / len(clean), 2) if clean else None,
            "cases": results}
-    summary = {k: run[k] for k in ("recall", "noise", "errors", "guidance")}
+    summary = dict({k: run[k] for k in ("recall", "noise", "errors", "guidance")}, raw=raw_dir)
     if a.only:
         print(json.dumps(summary), "\npartial run (--only): not recorded in history")
-        return
+        sys.exit(2 if run["errors"] else 0)
     hist = os.path.join(root, EVAL_DIR, "history.jsonl")
     prev = None
     if os.path.exists(hist):
@@ -737,6 +841,7 @@ def eval_run(root, cfg, a):
     with open(hist, "a") as f:
         f.write(json.dumps(run) + "\n")
     print(json.dumps(summary), "\nverdict:", verdict(run, prev))
+    sys.exit(2 if run["errors"] else 0)  # 2: a case failed to run, so the scores aren't trustworthy
 
 
 def eval_list(root, cfg, a):
@@ -873,7 +978,7 @@ def sweep_area(root, pattern, files):
 
 
 def cmd_sweep_target(root, cfg, a):
-    files = git(root, "ls-files").splitlines()
+    files = nul_paths(git(root, "ls-files", "-z", raw=True))
     highs = (cfg.get("risk") or {}).get("high") or []
     cands = sorted(filter(None, (sweep_area(root, p, files) for p in highs)))
     cands = sorted(set(cands))
@@ -975,7 +1080,7 @@ def hook_stop(data, root, cfg):
     tree = worktree_tree(root)
     files = set(entry.get("files", []))
     if base and base != tree:  # the turn's snapshot also catches edits made through Bash
-        files.update(filter(None, git(root, "diff", "--name-only", base, tree, check=False).splitlines()))
+        files.update(diff_paths(root, base, tree))
     if not files or st.get("green") == tree or entry.get("red") == tree:
         # nothing changed this turn, or already green, or red on this exact tree: Claude saw the
         # failure and chose to stop (e.g. to ask the user), and re-running would change nothing
@@ -1101,6 +1206,11 @@ def main(argv=None):
     f.add_argument("id", nargs="?")
     f.add_argument("--status", choices=["fixed", "wontfix", "pre-existing", "open"])
     f.add_argument("--reason")
+    sg = sub.add_parser("stage", help="record that a review stage of the current round ran (or why it didn't)")
+    sg.add_argument("kind", choices=STAGES)
+    sg.add_argument("--status", required=True, choices=["completed", "skipped", "not_run"])
+    sg.add_argument("--reason")
+    sg.add_argument("--effort")
     s = sub.add_parser("stamp", help="bind the green tree and its tier to a preflight stamp")
     s.add_argument("--tier", choices=TIERS, help="raise the tier above the path-based floor")
     sub.add_parser("status", help="show green/stamp state for the worktree and HEAD")
@@ -1143,7 +1253,7 @@ def main(argv=None):
     cfg = load_config(root)
     if cfg is None:
         die("no %s here; run /land-it:init" % CONFIG)
-    {"check": cmd_check, "risk": cmd_risk, "round": cmd_round, "findings": cmd_findings,
+    {"check": cmd_check, "risk": cmd_risk, "round": cmd_round, "findings": cmd_findings, "stage": cmd_stage,
      "stamp": cmd_stamp, "status": cmd_status, "eval": cmd_eval, "trust": cmd_trust,
      "stats": cmd_stats, "threads": cmd_threads, "sweep-target": cmd_sweep_target}[a.cmd](root, cfg, a)
 

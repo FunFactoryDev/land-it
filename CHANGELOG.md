@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.7.0
+
+The stamp now means what the README says. Each item closes a finding from the independent audit, with its
+reproduction as a regression test.
+
+**Upgrading:** preflight records review stages with `land-it stage`; a stamp from a flow that didn't record them is
+refused. Formatters that ran as `checks` now fail the check (they change the tree): move them to `on_edit` or use
+their check mode.
+
+- **Review stages.** `land-it stage code|security|verify|simplify --status completed|skipped|not_run [--reason]`
+  records what actually ran in the current round. The stamp requires, per tier (`required_stages`): low `code`;
+  medium `code`, `security`; high `code`, `security`, `verify` (only `verify` may be `not_run`, with a reason).
+  `round` reports `reviewed: true` only when the round's code review completed, so a started round no longer
+  passes for a finished one. The stamp records the base, the reviewed tree and the stages, and says
+  `changed_after_review` when fixes followed the review.
+- **Fresh checks.** A failing `check` clears the tree's green mark and any stamp of it. Checks that change the
+  tree under themselves (formatters, codegen, an edit meanwhile) don't count as green.
+- **No base, no guess.** When the base branch can't be found, `risk` and `stamp` refuse with a hint to set `base`,
+  instead of reading an uncomputable diff as an empty, low-risk one.
+- **Renames and Unicode.** Changed files come from `git diff --name-status -z -M`: a rename counts both paths
+  (moving a file out of a high-risk area is a high-risk change), and non-ASCII names match their globs.
+- **Pre-existing is a decision, not a blame result.** `findings add` keeps every finding open and adds a hint,
+  `introduced: before | this-change | unknown`; `pre-existing` and `wontfix` both need a reason.
+- **Behavior checks run things.** The preflight fallback for an unavailable reviewer covers code and security
+  review only; a behavior check that can't run is recorded as `verify --status not_run` with a reason.
+- **Evals you can trust.** `eval run` exits 2 when a case failed to run. The judge must exit 0 and return
+  non-negative counts no higher than the recorded bugs. Runs compare only on the same corpus (a content
+  fingerprint, so an edited case starts a new baseline) and the same scorer (judge command and prompt included);
+  unmeasured noise counts as unknown, not zero. Raw reviewer output per case goes to `.git/land-it/eval-runs/`.
+  The judge's accuracy against human labels isn't measured, and the docs say so.
+- Metrics: a real median for even samples. An invalid `.claude/land-it.json` is a clear error, not a traceback.
+- README: a "What the stamp proves, and what it doesn't" section.
+
 ## 0.6.2
 
 Security fixes from an independent audit of 0.6.0; each reproduction is now a regression test.

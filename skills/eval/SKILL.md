@@ -46,14 +46,16 @@ land-it eval run [--model M] [--effort low|medium|high|xhigh|max] [--only ID ...
 - **noise**: findings per known-good case.
 - `--judge haiku` scores with an LLM judge instead: it reads each review and decides whether the recorded defect
   is reported (worded differently or cited elsewhere still counts) and how many distinct findings there are.
-  It costs one small extra call per case and is more accurate; runs with different scorers aren't compared.
+  It costs one small extra call per case. Its agreement with human judgment isn't measured yet, so present the
+  verdict as a recommendation; runs with different scorers aren't compared.
 - The **verdict** compares with the previous full run: keep a reviewer change only when recall rises, or recall
   holds and noise drops. Revert it otherwise. Priority is catching real bugs first, fewer review rounds second.
-- `--only` runs a subset for iterating and isn't recorded. A run where a case failed isn't compared.
+- `--only` runs a subset for iterating and isn't recorded. A run where a case failed isn't compared and exits 2,
+  so a script or CI can tell "the reviewer got worse" from "the run broke".
 
 ## Tuning loop
 
-1. A case is missed → read that review's output (`--only <id>`), work out what rule would have caught it,
+1. A case is missed → read that review's raw output (the run prints where it saved them, under `.git/land-it/eval-runs/`), work out what rule would have caught it,
    and add it at the source: a line in REVIEW.md (what failure looks like, an invariant to always check), CLAUDE.md,
    or a lint rule if a machine can check it.
 2. `land-it eval run --only <id>` until it's caught, then a full `land-it eval run` to be sure nothing else got worse.
