@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.2
+
+Security fixes from an independent audit of 0.6.0; each reproduction is now a regression test.
+
+- **Self-trust closed.** `land-it hook …` refuses to run outside Claude Code's hooks (they export `CLAUDE_PLUGIN_ROOT`;
+  Bash commands don't), and the policy hook denies Claude's `land-it hook` and writes to the trust store. Before,
+  Claude could pipe a fake `UserPromptExpansion` payload into `land-it hook expand` through the pre-approved
+  `Bash(land-it *)` and trust its own config commands.
+- **No shell injection through file names.** `on_edit` hands the path over in `$LAND_IT_FILE`; `{file}` becomes
+  `"$LAND_IT_FILE"`. Before, `"{file}"` inside the user's own quotes let a name like `$(cmd).py` run.
+- **Eval overlay can't write outside the checkout.** Today's guidance replaces a symlinked file in the old commit
+  instead of writing through it, and a symlinked directory makes the case fail as unsafe.
+- **Eval ids and line ranges are validated**; `--id ../x` no longer writes outside `.land-it/evals/`.
+- **The policy hook fails closed** (`onFailure: "block"`): a crash or timeout blocks the command instead of allowing it.
+- `gh -R owner/repo pr …` and `--repo=` forms go through the same PR gates.
+- README: what trust does and doesn't cover, and that the Bash gates mirror GitHub enforcement rather than replace it.
+- `RECOMMENDATIONS.ru.md`, an internal audit accidentally committed in 0.6.1, is no longer tracked.
+
 ## 0.6.1
 
 land-it reviewed its own code with `/code-review` (fresh context, medium effort): 10 findings, 9 fixed, 1 won't fix.

@@ -567,6 +567,8 @@ def eval_add(root, cfg, a):
     start, _, end = (a.range or "%s^..%s" % (a.commit, a.commit)).partition("..")
     rng = "%s..%s" % (git(root, "rev-parse", start), git(root, "rev-parse", end))
     cid = a.id or rng[-40:][:10]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", cid):
+        die("eval id %r: use letters, digits, '.', '_' or '-' (it becomes a file name)" % cid)
     path = os.path.join(root, EVAL_DIR, cid + ".json")
     case = {"id": cid, "range": rng, "kind": "clean" if a.clean else "bug", "expect": [],
             "note": a.note or "", "added": time.strftime("%Y-%m-%d")}
@@ -576,12 +578,29 @@ def eval_add(root, cfg, a):
         if case["range"] != rng or case["kind"] != ("clean" if a.clean else "bug"):
             die("case %s already exists for another range or kind; pass --id" % cid)
     if not a.clean:
-        lo, _, hi = a.line.partition("-")
-        case["expect"].append({"file": a.file, "lines": [int(lo), int(hi or lo)], "summary": a.summary})
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", a.line.strip())
+        lo, hi = (int(m.group(1)), int(m.group(2) or m.group(1))) if m else (0, 0)
+        if not (1 <= lo <= hi):
+            die("--line %r: use N or N-M with 1 <= N <= M" % a.line)
+        case["expect"].append({"file": a.file, "lines": [lo, hi], "summary": a.summary})
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(case, f, indent=1)
     print(json.dumps(case, indent=1))
+
+
+def overlay(wt, rel, src):
+    """Copy src to wt/rel without following a symlink the old commit may have put there. False if unsafe."""
+    dst, top = os.path.join(wt, rel), os.path.realpath(wt)
+    parent = os.path.dirname(dst)
+    os.makedirs(parent, exist_ok=True)
+    if not (os.path.realpath(parent) + os.sep).startswith(top + os.sep) and os.path.realpath(parent) != top:
+        return False
+    fd, tmp = tempfile.mkstemp(dir=parent, prefix=".land-it-")
+    with os.fdopen(fd, "wb") as f, open(src, "rb") as s:
+        shutil.copyfileobj(s, f)
+    os.replace(tmp, dst)  # rename replaces a symlink at dst itself, never its target
+    return True
 
 
 def run_reviewer(wt, rng, a):
@@ -675,11 +694,10 @@ def eval_run(root, cfg, a):
         wt = os.path.join(tmp, "wt")
         git(root, "worktree", "add", "--detach", "--quiet", wt, c["range"].split("..")[1])
         try:
-            for rel in GUIDANCE:  # the old change, reviewed under today's rules: that's what is being tested
-                if os.path.exists(os.path.join(root, rel)):
-                    os.makedirs(os.path.dirname(os.path.join(wt, rel)) or wt, exist_ok=True)
-                    shutil.copy2(os.path.join(root, rel), os.path.join(wt, rel))
-            code, text = run_reviewer(wt, c["range"], a)
+            unsafe = [rel for rel in GUIDANCE  # the old change, reviewed under today's rules: that's what's tested
+                      if os.path.exists(os.path.join(root, rel)) and not overlay(wt, rel, os.path.join(root, rel))]
+            code, text = (1, "unsafe path in the old commit (a symlink out of the checkout): %s" % ", ".join(unsafe)
+                          ) if unsafe else run_reviewer(wt, c["range"], a)
         finally:
             git(root, "worktree", "remove", "--force", wt, check=False)
             shutil.rmtree(tmp, ignore_errors=True)
@@ -936,8 +954,10 @@ def hook_post_edit(data, root, cfg):
     problems = []
     for pat, cmd in on_edit.items():
         if matches(pat, rel) and os.path.exists(path):
-            cmd = cmd.replace("{file}", shlex.quote(path))
-            r = subprocess.run(cmd, shell=True, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            # the path goes in through the environment, so no quoting in the user's command can make it code
+            cmd = cmd.replace("{file}", '"$LAND_IT_FILE"')
+            r = subprocess.run(cmd, shell=True, cwd=root, env=dict(os.environ, LAND_IT_FILE=path),
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             if r.returncode:
                 problems.append("$ %s\n%s" % (cmd, tail(r.stdout, 1500)))
     if problems:
@@ -986,10 +1006,13 @@ def hook_stop(data, root, cfg):
           "say so and stop again without changes.\n\n" + tail(log)})
 
 
-GH_PR_CREATE = re.compile(r"\bgh\s+pr\s+create\b")
-GH_PR_MERGE = re.compile(r"\bgh\s+pr\s+merge\b([^;&|\n]*)")
-GH_PR_APPROVE = re.compile(r"\bgh\s+pr\s+review\b[^;&|\n]*(?:--approve|\s-a\b)")
-TRUST_CMD = re.compile(r"land-it\S*\s+trust\b")
+# ponytail: text patterns, not a shell parser; they catch the usual forms. Enforcement that has to hold
+# belongs in GitHub (branch protection, required checks), which these gates only mirror.
+GH_PR = r"\bgh(?:\s+(?:-R|--repo)(?:=|\s+)\S+)?\s+pr\s+"
+GH_PR_CREATE = re.compile(GH_PR + r"create\b")
+GH_PR_MERGE = re.compile(GH_PR + r"merge\b([^;&|\n]*)")
+GH_PR_APPROVE = re.compile(GH_PR + r"review\b[^;&|\n]*(?:--approve|\s-a\b)")
+TRUST_CMD = re.compile(r"land-it\S*\s+(?:trust|hook)\b|\.land-it/trust\.json")
 # Gates the wrapper because land-it's skills pre-approve `Bash(land-it *)`. A direct `gh api` or `gh pr comment`
 # isn't pre-approved by them, so Claude Code's own permission prompt already covers it.
 THREAD_WRITE = re.compile(r"land-it\S*\s+threads\b[^;&|\n]*\b(?:reply|resolve)\b")
@@ -1008,7 +1031,8 @@ def hook_pre_bash(data, root, cfg):
         return
     # every deny before any ask: a combined command must not slip a deny past an ask's prompt
     if trust:
-        decide("deny", "land-it: only the user can trust config commands, by typing /land-it:trust.")
+        decide("deny", "land-it: only the user can trust config commands, by typing /land-it:trust "
+               "(and the hook entry point and the trust store aren't for Claude's shell).")
     if approve:
         decide("deny", "land-it: an agent's approval never counts as a person's. Approving a PR is for a human.")
     stamp, stamped_head = {}, False
@@ -1051,6 +1075,10 @@ def cmd_trust(root, cfg, a):
 
 
 def run_hook(event):
+    # Claude Code exports CLAUDE_PLUGIN_ROOT to hook processes, not to commands Claude runs through Bash.
+    # Without this, `echo '{"command_name": "land-it:trust"}' | land-it hook expand` would let Claude trust itself.
+    if not os.environ.get("CLAUDE_PLUGIN_ROOT"):
+        die("`land-it hook` is the entry point for hooks/hooks.json; it doesn't run from a shell")
     try:
         data = json.load(sys.stdin)
     except ValueError:

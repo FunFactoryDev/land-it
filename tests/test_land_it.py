@@ -51,7 +51,9 @@ class Repo:
         sh(self.root, "git", "commit", "-qm", msg)
 
     def cli(self, *args, stdin="", env=None):
-        env = dict(os.environ, LAND_IT_HOME=self._home.name, **(env or {}))
+        full = dict(os.environ, LAND_IT_HOME=self._home.name, CLAUDE_PLUGIN_ROOT=os.path.dirname(os.path.dirname(BIN)))
+        full.update(env or {})
+        env = full
         return subprocess.run([sys.executable, BIN, *args], cwd=self.root, input=stdin, capture_output=True, text=True,
                               env=env)
 
@@ -583,6 +585,88 @@ class EvalScan(unittest.TestCase):
         self.assertEqual(json.loads(r.cli("eval", "scan").stdout), [])
         sh(r.root, "git", "revert", "--no-edit", "HEAD")  # reapply: reverting the revert isn't an incident
         self.assertEqual(json.loads(r.cli("eval", "scan").stdout), [])
+
+
+
+class AuditRegressions(unittest.TestCase):
+    """Reproductions from the 2026-10-24 audit (RECOMMENDATIONS.ru.md), one per finding fixed in 0.6.2."""
+
+    def test_r13_claude_cant_trust_itself_through_the_hook_entry(self):
+        r = Repo(self, {"checks": {"t": "touch PWNED"}}, trust=False)
+        fake = json.dumps({"command_name": "land-it:trust", "cwd": r.root})
+        out = r.cli("hook", "expand", stdin=fake, env={"CLAUDE_PLUGIN_ROOT": ""})
+        self.assertNotEqual(out.returncode, 0, "a shell call isn't a hook")
+        self.assertFalse(json.loads(r.cli("status").stdout)["commands_trusted"])
+        for cmd in ("echo '%s' | land-it hook expand" % fake, "python3 ~/p/bin/land-it hook expand < f.json",
+                    "echo {} > ~/.land-it/trust.json"):
+            out = r.hook("pre-bash", tool_input={"command": cmd})
+            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny", cmd)
+
+    def test_r14_a_file_name_never_runs_as_code(self):
+        r = Repo(self, {"on_edit": {"*.py": 'printf "%s" "{file}" > /dev/null', "*.txt": "test -f {file}"}})
+        r.edit("$(touch INJECTED).py", "x\n")
+        self.assertFalse(os.path.exists(os.path.join(r.root, "INJECTED")))
+        self.assertIsNone(r.edit("a b's.txt", "x\n"), "an unquoted {file} still gets the exact path")
+
+    def old_commit_with_symlink(self, r, link, target):
+        os.symlink(target, os.path.join(r.root, link))
+        r.write("a.py", "x = 2\n")
+        r.commit("old commit with %s as a symlink" % link)
+        bad = sh(r.root, "git", "rev-parse", "HEAD").strip()
+        os.remove(os.path.join(r.root, link))
+        return bad
+
+    def test_r10_eval_overlay_replaces_a_symlinked_file_without_following_it(self):
+        r = Repo(self, {})
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside)
+        sentinel = os.path.join(outside, "sentinel")
+        with open(sentinel, "w") as f:
+            f.write("untouched")
+        bad = self.old_commit_with_symlink(r, "REVIEW.md", sentinel)
+        r.write("REVIEW.md", "today's rules\n")
+        r.commit("real REVIEW.md")
+        r.cli("eval", "add", "--commit", bad, "--file", "a.py", "--line", "1", "--summary", "x")
+        out = r.cli("eval", "run", "--reviewer", "grep -q \"today's rules\" REVIEW.md && echo a.py:1")
+        self.assertIn("caught 1/1", out.stdout, "the reviewer saw today's rules")
+        with open(sentinel) as f:
+            self.assertEqual(f.read(), "untouched")
+
+    def test_r10_eval_refuses_a_symlinked_directory(self):
+        r = Repo(self, {})
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside)
+        os.rename(os.path.join(r.root, ".claude"), os.path.join(r.root, ".claude-real"))
+        bad = self.old_commit_with_symlink(r, ".claude", outside)
+        os.rename(os.path.join(r.root, ".claude-real"), os.path.join(r.root, ".claude"))
+        r.commit("real .claude")
+        r.cli("eval", "add", "--commit", bad, "--file", "a.py", "--line", "1", "--summary", "x")
+        out = r.cli("eval", "run", "--reviewer", "echo a.py:1")
+        self.assertIn("unsafe path", out.stdout)
+        self.assertEqual(os.listdir(outside), [], "nothing written outside the checkout")
+
+    def test_e07_eval_ids_and_lines_are_validated(self):
+        r = Repo(self, {})
+        r.write("a.py", "x = 2\n")
+        r.commit("second")
+        for args in (["--id", "../../escape", "--clean"], ["--file", "a.py", "--line", "0", "--summary", "s"],
+                     ["--file", "a.py", "--line", "9-3", "--summary", "s"]):
+            out = r.cli("eval", "add", "--commit", "HEAD", *args)
+            self.assertNotEqual(out.returncode, 0, args)
+            self.assertNotIn("Traceback", out.stderr)
+        self.assertFalse(any(f.endswith("escape.json") for _, _, fs in os.walk(os.path.dirname(r.root)) for f in fs))
+
+    def test_r06_repo_flag_doesnt_slip_past_the_gates(self):
+        r = Repo(self, {"checks": {"ok": "true"}})
+        decision = lambda cmd: r.hook("pre-bash", tool_input={"command": cmd})["hookSpecificOutput"]["permissionDecision"]
+        self.assertEqual(decision("gh -R owner/repo pr create --fill"), "deny")
+        self.assertEqual(decision("gh --repo=owner/repo pr merge 3"), "ask")
+        self.assertEqual(decision("gh --repo owner/repo pr review 3 --approve"), "deny")
+
+    def test_r15_policy_hook_fails_closed(self):
+        with open(os.path.join(os.path.dirname(os.path.dirname(BIN)), "hooks", "hooks.json")) as f:
+            pre = json.load(f)["hooks"]["PreToolUse"][0]["hooks"][0]
+        self.assertEqual(pre.get("onFailure"), "block")
 
 
 if __name__ == "__main__":

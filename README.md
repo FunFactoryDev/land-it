@@ -168,7 +168,7 @@ Requirements: git, Python 3.9+ (stdlib only, nothing to install), a recent Claud
 | Key | Meaning |
 |---|---|
 | `checks` | Ordered name → command, run from the repo root; stops at the first failure. A check can be `{"run", "paths"}` to run only when the change touches those paths |
-| `on_edit` | Glob → command run after Claude edits a matching file; `{file}` is the shell-quoted path |
+| `on_edit` | Glob → command run after Claude edits a matching file; `{file}` is the edited file's path, handed over through `$LAND_IT_FILE`, so no file name can run as code. Write it without quotes |
 | `stop_checks` | Which checks the Stop hook runs (default: all). Leave slow suites out; preflight runs every check |
 | `stop_gate` | `false` turns the Stop hook off |
 | `risk` | `high` / `medium` / `low` globs. Unlisted paths are medium. Defaults: `*.md`, `docs/**`, `LICENSE*` low; `CLAUDE.md`, `REVIEW.md`, `.claude/**` medium; CI workflows, CODEOWNERS and this file always high |
@@ -191,6 +191,8 @@ Until you trust the current commands, nothing from the config runs: hooks tell y
 refuses. You trust them by **typing** `/land-it:trust`: the `UserPromptExpansion` hook fires only for commands a
 person types, not for skills the model invokes, and the skill itself is marked user-only. From a terminal outside
 Claude Code, `land-it trust` asks for a `y`. Any change to a command needs trust again; changes to other keys don't.
+
+What this covers: a config edit can't become command execution without you, and Claude can't approve its own commands, whether through `land-it trust`, the hook entry point (`land-it hook` refuses to run outside Claude Code's hooks) or the trust store. What it doesn't: an agent you've allowed to run any shell command can do whatever your user account can. Trusting `npm test` also doesn't vouch for the code it runs; checks from an untrusted PR belong in an isolated CI runner.
 
 ## Evals
 
@@ -260,6 +262,7 @@ The plugin puts `land-it` on Claude's PATH; the skills call it. You can call it 
 ## Limitations
 
 - The gates cover Claude's tool calls. You can still run `gh pr create` yourself; that's deliberate.
+- The Bash gates match command text (the usual `gh pr …` forms, `-R/--repo` included), not a parsed shell. They mirror GitHub's branch protection and required checks, which is where enforcement that must hold belongs. The policy hook fails closed: if it crashes or times out, the command is blocked.
 - Tested on macOS. Windows is untested: hooks call `python3`, and there's no state lock (no `fcntl`).
 - `/security-review` needs `origin/HEAD`; without a remote, preflight runs the security pass in a fresh subagent.
 - Eval recall counts any `file:line` the review cites near the recorded bug; noise counts every cited location.

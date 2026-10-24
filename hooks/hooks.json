@@ -35,7 +35,7 @@
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/land-it", "hook", "pre-bash"], "timeout": 30 }
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/land-it", "hook", "pre-bash"], "timeout": 30, "onFailure": "block" }
         ]
       }
     ]
