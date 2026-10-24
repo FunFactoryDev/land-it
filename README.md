@@ -143,7 +143,7 @@ Requirements: git, Python 3.9+ (stdlib only, nothing to install), a recent Claud
 | `UserPromptSubmit` | Snapshots the working tree, so each turn is judged on its own changes (your edits between turns aren't Claude's) |
 | `PostToolUse` (Edit, Write) | Runs the matching `on_edit` commands on the edited file; a failure goes back to Claude |
 | `Stop` | If the turn changed non-docs files: runs `stop_checks` (path-scoped ones only when touched). Red: blocks the stop with the output, at most 3 times per turn. A docs-only turn, or a stop on the same red tree Claude already saw, passes |
-| `PreToolUse` (Bash) | `gh pr create` needs the stamp on HEAD's tree; `gh pr review --approve` is denied; `gh pr merge` asks you unless HEAD is stamped low; `land-it trust` from Claude's shell is denied; `land-it threads reply` always asks you, because it posts under your account |
+| `PreToolUse` (Bash) | `gh pr create` needs the stamp on HEAD's tree; `gh pr review --approve` is denied; `gh pr merge` asks you unless HEAD is stamped low; `land-it trust` from Claude's shell is denied; `land-it threads reply` and `resolve` always ask you, because they act under your account. Every deny is checked before any ask, so a combined command can't slip a deny through a prompt |
 | `UserPromptExpansion` | When *you* type `/land-it:trust`, records trust for the current commands |
 
 ## Configuration: `.claude/land-it.json`
@@ -242,7 +242,7 @@ The plugin puts `land-it` on Claude's PATH; the skills call it. You can call it 
 | `land-it status` | Trust, green and stamp state for the worktree and HEAD |
 | `land-it trust` | Approve the config's commands, at your own terminal |
 | `land-it eval [list \| scan \| add … \| run …]` | Reviewer evals; `scan` finds reverts that aren't cases yet |
-| `land-it threads [PR \| reply ID --body B --resolve]` | Unresolved review threads on a PR (bots told apart); reply to one and resolve it |
+| `land-it threads [PR \| reply ID --body B [--resolve] \| resolve ID]` | Unresolved review threads on a PR (given as N, #N or a URL; bots told apart); reply to one, resolve one |
 | `land-it sweep-target [--day N]` | Today's area for the sweep, rotating over `risk.high` |
 | `land-it stats [--days N] [--github]` | One-round passes, rounds, finding outcomes, reverts, the circuit breaker; GitHub human time |
 

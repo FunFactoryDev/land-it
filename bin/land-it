@@ -11,6 +11,7 @@ import functools
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -228,7 +229,8 @@ def merge_base(root, cfg):
     return git(root, "merge-base", "HEAD", base, check=False) if base else ""
 
 
-REVERT = re.compile(r'^Revert "|This reverts commit [0-9a-f]{7,}', re.M)
+REVERTS_COMMIT = re.compile(r"This reverts commit ([0-9a-f]{7,40})")
+REVERT = re.compile(r'^Revert "|' + REVERTS_COMMIT.pattern, re.M)
 BREAKER = {"revert_rate": 0.05, "days": 14, "min_commits": 20}
 
 
@@ -471,9 +473,8 @@ MERGED_PRS = """query($q: String!, $endCursor: String) {
 
 def github_stats(root, days):
     since = time.strftime("%Y-%m-%d", time.gmtime(time.time() - days * DAY))
-    r = subprocess.run(["gh", "api", "graphql", "--paginate", "-f", "query=" + MERGED_PRS,
-                        "-F", "q=repo:{owner}/{repo} is:pr is:merged merged:>=" + since,
-                        "--jq", ".data.search.nodes[]"], cwd=root, capture_output=True, text=True)
+    r = gh_run(root, "api", "graphql", "--paginate", "-f", "query=" + MERGED_PRS,
+               "-F", "q=repo:{owner}/{repo} is:pr is:merged merged:>=" + since, "--jq", ".data.search.nodes[]")
     if r.returncode:
         return {"error": tail(r.stderr.strip(), 300)}
     prs = [json.loads(ln) for ln in r.stdout.splitlines() if ln.strip()]
@@ -734,10 +735,12 @@ def eval_scan(root, cfg, a):
     found = []
     for rec in filter(str.strip, out.split("\x1e")):
         sha, subject, date, body = (rec.strip("\n").split("\x1f") + ["", "", ""])[:4]
-        m = re.search(r"This reverts commit ([0-9a-f]{7,40})", body)
+        m = REVERTS_COMMIT.search(body)
         if m:
             reverted = git(root, "rev-parse", "--verify", "--quiet", m.group(1) + "^{commit}", check=False)
-            if reverted and reverted not in have:
+            reapply = reverted and REVERT.search(git(root, "log", "-1", "--format=%B", reverted, check=False))
+            # not --first-parent: in merge-commit flows the "This reverts commit" line sits on the branch commit
+            if reverted and not reapply and reverted not in have:
                 found.append({"revert": sha, "reverted": reverted, "subject": subject, "date": date})
     print(json.dumps(found, indent=1))
 
@@ -752,7 +755,7 @@ THREADS = """query($owner: String!, $repo: String!, $pr: Int!, $endCursor: Strin
   repository(owner: $owner, name: $repo) { pullRequest(number: $pr) {
     reviewThreads(first: 50, after: $endCursor) {
       pageInfo { hasNextPage endCursor }
-      nodes { id isResolved isOutdated path line
+      nodes { id isResolved isOutdated path line originalLine
         comments(first: 20) { nodes { author { __typename login } body url } } }
     } } }
 }"""
@@ -761,27 +764,55 @@ REPLY = """mutation($id: ID!, $body: String!) {
 RESOLVE = """mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }"""
 
 
+def gh_run(root, *args):
+    return subprocess.run(["gh", *args], cwd=root, capture_output=True, text=True)
+
+
 def gh(root, *args):
-    r = subprocess.run(["gh", *args], cwd=root, capture_output=True, text=True)
+    r = gh_run(root, *args)
     if r.returncode:
         die("gh %s: %s" % (args[0], tail(r.stderr.strip(), 300)))
     return r.stdout
 
 
+def graphql_payload(stdout, field):
+    try:
+        return (json.loads(stdout).get("data") or {}).get(field) or {}
+    except ValueError:
+        return {}
+
+
+def resolve_thread(root, tid):
+    r = gh_run(root, "api", "graphql", "-f", "query=" + RESOLVE, "-F", "id=" + tid)
+    return r.returncode == 0 and bool(graphql_payload(r.stdout, "resolveReviewThread").get("thread"))
+
+
 def cmd_threads(root, cfg, a):
     args = list(a.args)
-    action = args.pop(0) if args and args[0] in ("list", "reply") else "list"
+    action = args.pop(0) if args and args[0] in ("list", "reply", "resolve") else "list"
     a.pr_or_id = args[0] if args else None
+    if action == "resolve":
+        if not (a.pr_or_id and resolve_thread(root, a.pr_or_id)):
+            die("could not resolve thread %s" % a.pr_or_id)
+        print(json.dumps({"resolved": True}, indent=1))
+        return
     if action == "reply":
         if not (a.pr_or_id and a.body):
             die("usage: land-it threads reply THREAD_ID --body TEXT [--resolve]")
-        url = json.loads(gh(root, "api", "graphql", "-f", "query=" + REPLY, "-F", "id=" + a.pr_or_id, "-f", "body=" + a.body)
-                         )["data"]["addPullRequestReviewThreadReply"]["comment"]["url"]
-        if a.resolve:
-            gh(root, "api", "graphql", "-f", "query=" + RESOLVE, "-F", "id=" + a.pr_or_id)
+        out = gh(root, "api", "graphql", "-f", "query=" + REPLY, "-F", "id=" + a.pr_or_id, "-f", "body=" + a.body)
+        url = (graphql_payload(out, "addPullRequestReviewThreadReply").get("comment") or {}).get("url")
+        if not url:
+            die("no reply posted: GitHub returned nothing for thread %s" % a.pr_or_id)
+        if a.resolve and not resolve_thread(root, a.pr_or_id):
+            # the reply is out; a retry of the whole command would post it twice
+            die("replied at %s, but resolving failed; run `land-it threads resolve %s`, don't reply again"
+                % (url, a.pr_or_id))
         print(json.dumps({"replied": url, "resolved": bool(a.resolve)}, indent=1))
         return
-    pr = a.pr_or_id or gh(root, "pr", "view", "--json", "number", "-q", ".number").strip()
+    m = re.search(r"(\d+)/?$", a.pr_or_id or gh(root, "pr", "view", "--json", "number", "-q", ".number").strip())
+    if not m:
+        die("not a pull request number: %s" % a.pr_or_id)
+    pr = int(m.group(1))
     out = gh(root, "api", "graphql", "--paginate", "-f", "query=" + THREADS, "-F", "owner={owner}", "-F", "repo={repo}",
              "-F", "pr=" + str(pr), "--jq", ".data.repository.pullRequest.reviewThreads.nodes[]")
     threads = []
@@ -790,10 +821,10 @@ def cmd_threads(root, cfg, a):
         if t.get("isResolved") or not cs:
             continue
         first = cs[0]
-        threads.append({"id": t["id"], "path": t.get("path"), "line": t.get("line"), "outdated": t.get("isOutdated"),
+        threads.append({"id": t["id"], "path": t.get("path"), "line": t.get("line") or t.get("originalLine"), "outdated": t.get("isOutdated"),
                         "author": (first.get("author") or {}).get("login"), "bot": not is_human(first.get("author")),
                         "body": tail(first.get("body") or "", 1500), "replies": len(cs) - 1, "url": first.get("url")})
-    print(json.dumps({"pr": int(pr), "unresolved": threads}, indent=1))
+    print(json.dumps({"pr": pr, "unresolved": threads}, indent=1))
 
 
 # --- sweep: the article's nightly agents, one area at a time ---------------------------
@@ -811,10 +842,23 @@ def static_prefix(pattern):
     return "/".join(parts)
 
 
+def sweep_area(root, pattern, files):
+    """Where a risk.high glob points: its static prefix if that exists (src/billing/** -> src/billing),
+    else the common parent of the files it matches (a slash-less "billing" -> src/billing). None if they share none."""
+    hits = [f for f in files if matches(pattern, f)]
+    prefix = static_prefix(pattern)
+    if not hits:
+        return None
+    if prefix and os.path.exists(os.path.join(root, prefix)):
+        return prefix
+    return posixpath.commonpath(hits) or None
+
+
 def cmd_sweep_target(root, cfg, a):
     files = git(root, "ls-files").splitlines()
     highs = (cfg.get("risk") or {}).get("high") or []
-    cands = sorted({static_prefix(p) for p in highs if static_prefix(p) and any(matches(p, f) for f in files)})
+    cands = sorted(filter(None, (sweep_area(root, p, files) for p in highs)))
+    cands = sorted(set(cands))
     source = "risk.high"
     if not cands:  # no high-risk paths configured: rotate over the top-level source directories
         cands = sorted({f.split("/", 1)[0] for f in files if "/" in f} - SWEEP_SKIP)
@@ -946,7 +990,9 @@ GH_PR_CREATE = re.compile(r"\bgh\s+pr\s+create\b")
 GH_PR_MERGE = re.compile(r"\bgh\s+pr\s+merge\b([^;&|\n]*)")
 GH_PR_APPROVE = re.compile(r"\bgh\s+pr\s+review\b[^;&|\n]*(?:--approve|\s-a\b)")
 TRUST_CMD = re.compile(r"land-it\S*\s+trust\b")
-THREAD_REPLY = re.compile(r"land-it\S*\s+threads\s+reply\b")
+# Gates the wrapper because land-it's skills pre-approve `Bash(land-it *)`. A direct `gh api` or `gh pr comment`
+# isn't pre-approved by them, so Claude Code's own permission prompt already covers it.
+THREAD_WRITE = re.compile(r"land-it\S*\s+threads\b[^;&|\n]*\b(?:reply|resolve)\b")
 
 
 def decide(decision, reason):
@@ -956,21 +1002,26 @@ def decide(decision, reason):
 
 def hook_pre_bash(data, root, cfg):
     cmd = (data.get("tool_input") or {}).get("command") or ""
-    if TRUST_CMD.search(cmd):
-        decide("deny", "land-it: only the user can trust config commands, by typing /land-it:trust.")
-    if THREAD_REPLY.search(cmd):
-        decide("ask", "land-it: this posts a reply on the pull request under your GitHub account.")
     create, merge, approve = GH_PR_CREATE.search(cmd), GH_PR_MERGE.search(cmd), GH_PR_APPROVE.search(cmd)
-    if not (create or merge or approve):
+    trust, thread_write = TRUST_CMD.search(cmd), THREAD_WRITE.search(cmd)
+    if not (create or merge or approve or trust or thread_write):
         return
+    # every deny before any ask: a combined command must not slip a deny past an ask's prompt
+    if trust:
+        decide("deny", "land-it: only the user can trust config commands, by typing /land-it:trust.")
     if approve:
         decide("deny", "land-it: an agent's approval never counts as a person's. Approving a PR is for a human.")
-    stamp = load_state(root).get("stamp") or {}
-    stamped_head = bool(stamp.get("tree")) and stamp["tree"] == head_tree(root)
+    stamp, stamped_head = {}, False
+    if create or merge:
+        stamp = load_state(root).get("stamp") or {}
+        stamped_head = bool(stamp.get("tree")) and stamp["tree"] == head_tree(root)
     if create and not stamped_head:
         decide("deny", "land-it: HEAD has no preflight stamp, or it changed after the stamp. Run /land-it:preflight "
                "(the stamp covers exactly the tree it checked), commit everything it checked, then create the PR. "
                "To skip deliberately, the user can run the command themselves.")
+    asks = []
+    if thread_write:
+        asks.append("this replies to or resolves a review thread under your GitHub account")
     if merge:
         try:
             other_pr = [t for t in shlex.split(merge.group(1)) if not t.startswith("-")]
@@ -978,8 +1029,10 @@ def hook_pre_bash(data, root, cfg):
             other_pr = ["?"]
         if other_pr or not stamped_head or stamp.get("tier") != "low":
             tier = stamp.get("tier") if stamped_head else "unknown (no stamp for HEAD)"
-            decide("ask", "land-it: merging a change of tier %s is a human call; an agent's approval never "
-                   "counts as a person's. Only low-tier changes with green checks merge on automation alone." % tier)
+            asks.append("merging a change of tier %s is a human call; an agent's approval never counts as a "
+                        "person's, and only low-tier changes with green checks merge on automation alone" % tier)
+    if asks:
+        decide("ask", "land-it: " + "; ".join(asks) + ".")
 
 
 HOOKS = {"post-edit": hook_post_edit, "stop": hook_stop, "pre-bash": hook_pre_bash,
@@ -1044,8 +1097,8 @@ def main(argv=None):
     e.add_argument("--days", type=int, default=365, help="scan: how far back to look for reverts")
     e.add_argument("--judge-cmd", help="run: shell command that reads the judge prompt on stdin and prints the JSON")
     th = sub.add_parser("threads", help="unresolved review threads on a PR; reply (and resolve) one")
-    th.add_argument("args", nargs="*", metavar="PR | reply THREAD_ID",
-                    help="a PR number (default: this branch's PR), or `reply` and a thread id")
+    th.add_argument("args", nargs="*", metavar="PR | reply THREAD_ID | resolve THREAD_ID",
+                    help="a PR number, #N or URL (default: this branch's PR), or `reply`/`resolve` and a thread id")
     th.add_argument("--body")
     th.add_argument("--resolve", action="store_true")
     sw = sub.add_parser("sweep-target", help="today's area for the nightly sweep, rotating over risk.high")

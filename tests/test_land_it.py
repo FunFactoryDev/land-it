@@ -476,11 +476,14 @@ elif any("reviewThreads" in a for a in args):
     for t in [{"id": "T1", "isResolved": False, "isOutdated": False, "path": "a.py", "line": 2,
                "comments": {"nodes": [{"author": bot, "body": "Important: y is None", "url": "u1"}]}},
               {"id": "T2", "isResolved": True, "path": "a.py", "line": 1, "comments": {"nodes": [{"author": human, "body": "ok"}]}},
-              {"id": "T3", "isResolved": False, "isOutdated": True, "path": "b.py", "line": 5,
+              {"id": "T3", "isResolved": False, "isOutdated": True, "path": "b.py", "line": None, "originalLine": 5,
                "comments": {"nodes": [{"author": human, "body": "why?", "url": "u3"}, {"author": bot, "body": "because"}]}}]:
         print(json.dumps(t))
 elif any("addPullRequestReviewThreadReply" in a for a in args):
-    print(json.dumps({"data": {"addPullRequestReviewThreadReply": {"comment": {"url": "https://example/reply"}}}}))
+    payload = None if os.environ.get("NULL_REPLY") else {"comment": {"url": "https://example/reply"}}
+    print(json.dumps({"data": {"addPullRequestReviewThreadReply": payload}}))
+elif os.environ.get("FAIL_RESOLVE"):
+    sys.exit("GraphQL: Resource not accessible by integration")
 else:
     print(json.dumps({"data": {"resolveReviewThread": {"thread": {"isResolved": True}}}}))
 """
@@ -504,10 +507,14 @@ class GitHubLoop(unittest.TestCase):
     def test_lists_only_unresolved_threads_for_this_branch_pr(self):
         out = json.loads(self.r.cli("threads", env=self.env).stdout)
         self.assertEqual(out["pr"], 42)
-        self.assertEqual([(t["id"], t["bot"], t["replies"]) for t in out["unresolved"]], [("T1", True, 0), ("T3", False, 1)])
+        self.assertEqual([(t["id"], t["bot"], t["replies"], t["line"]) for t in out["unresolved"]],
+                         [("T1", True, 0, 2), ("T3", False, 1, 5)], "an outdated thread keeps its original line")
         self.assertIn("pr=42", self.calls()[-1])
-        self.assertEqual(json.loads(self.r.cli("threads", "7", env=self.env).stdout)["pr"], 7)
-        self.assertIn("pr=7", self.calls()[-1])
+        for given in ("7", "#7", "https://github.com/o/r/pull/7"):
+            self.assertEqual(json.loads(self.r.cli("threads", given, env=self.env).stdout)["pr"], 7, given)
+        bad = self.r.cli("threads", "abc", env=self.env)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertNotIn("Traceback", bad.stderr)
 
     def test_reply_and_resolve(self):
         out = json.loads(self.r.cli("threads", "reply", "T1", "--body", "Fixed in abc123", "--resolve", env=self.env).stdout)
@@ -516,10 +523,26 @@ class GitHubLoop(unittest.TestCase):
         self.assertIn("body=Fixed in abc123", reply)
         self.assertTrue(any("resolveReviewThread" in a for a in resolve) and "id=T1" in resolve)
 
+    def test_failed_resolve_never_invites_a_second_reply(self):
+        out = self.r.cli("threads", "reply", "T1", "--body", "Fixed", "--resolve", env=dict(self.env, FAIL_RESOLVE="1"))
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("replied at https://example/reply", out.stderr)
+        self.assertIn("land-it threads resolve T1", out.stderr)
+
+    def test_null_reply_payload_is_a_clean_error(self):
+        out = self.r.cli("threads", "reply", "T1", "--body", "x", env=dict(self.env, NULL_REPLY="1"))
+        self.assertNotEqual(out.returncode, 0)
+        self.assertNotIn("Traceback", out.stderr)
+
     def test_replying_always_asks_the_user(self):
-        out = self.r.hook("pre-bash", tool_input={"command": "land-it threads reply T1 --body 'won't fix: intended'"})
-        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
-        self.assertIsNone(self.r.hook("pre-bash", tool_input={"command": "land-it threads"}))
+        decision = lambda cmd: (self.r.hook("pre-bash", tool_input={"command": cmd}) or {}).get(
+            "hookSpecificOutput", {}).get("permissionDecision")
+        for cmd in ("land-it threads reply T1 --body 'intended'", "land-it threads --body hi reply T1",
+                    "land-it threads --resolve reply T1 --body hi", "land-it threads resolve T1"):
+            self.assertEqual(decision(cmd), "ask", cmd)
+        self.assertIsNone(decision("land-it threads"))
+        self.assertEqual(decision("land-it threads reply T1 --body ok && gh pr review 12 --approve"), "deny",
+                         "an ask must not let a combined deny through")
 
 
 class Sweep(unittest.TestCase):
@@ -528,8 +551,15 @@ class Sweep(unittest.TestCase):
         for path in ("src/billing/a.py", "src/auth/b.py", "db/x.sql"):
             r.write(path, "x\n")
         r.commit("areas")
-        picks = [json.loads(r.cli("sweep-target", "--day", str(d)).stdout)["target"] for d in (0, 1, 2)]
-        self.assertEqual(picks, ["src/auth", "src/billing", "src/auth"], "no-prefix and empty globs are skipped")
+        picks = [json.loads(r.cli("sweep-target", "--day", str(d)).stdout)["target"] for d in (0, 1, 2, 3)]
+        self.assertEqual(picks, ["db/x.sql", "src/auth", "src/billing", "db/x.sql"], "globs matching nothing are skipped")
+
+    def test_slash_less_glob_points_at_where_its_matches_live(self):
+        r = Repo(self, {"risk": {"high": ["billing"]}})
+        for path in ("src/billing/a.py", "src/billing/b.py"):
+            r.write(path, "x\n")
+        r.commit("billing")
+        self.assertEqual(json.loads(r.cli("sweep-target").stdout)["candidates"], ["src/billing"])
 
     def test_falls_back_to_top_level_dirs(self):
         r = Repo(self, {})
@@ -550,6 +580,8 @@ class EvalScan(unittest.TestCase):
         found = json.loads(r.cli("eval", "scan").stdout)
         self.assertEqual([f["reverted"] for f in found], [bad])
         r.cli("eval", "add", "--commit", bad, "--file", "a.py", "--line", "1", "--summary", "bad value")
+        self.assertEqual(json.loads(r.cli("eval", "scan").stdout), [])
+        sh(r.root, "git", "revert", "--no-edit", "HEAD")  # reapply: reverting the revert isn't an incident
         self.assertEqual(json.loads(r.cli("eval", "scan").stdout), [])
 
 

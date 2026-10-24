@@ -50,6 +50,9 @@ their yes; the hook asks again for each one. Then, per thread:
 - Won't fix: `Won't fix: <reason>.`; resolve a **bot's** thread, but leave a **person's** thread open for them to close.
 - Pre-existing: `Pre-existing (from <short sha>, before this PR); tracked in #<issue>.` and `--resolve`.
 
+If the reply posts but resolving fails, the command says so: run `land-it threads resolve <thread id>`, never the
+reply again, or the PR gets the same reply twice.
+
 Pushing the fix commits is part of answering; ask before `git push` if the user hasn't said to push.
 
 ## 6. Report

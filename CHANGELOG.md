@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.1
+
+land-it reviewed its own code with `/code-review` (fresh context, medium effort): 10 findings, 9 fixed, 1 won't fix.
+
+- PreToolUse checks every deny before any ask. Before, `land-it threads reply … && gh pr review --approve` stopped
+  at the reply's prompt, and approving that prompt let the agent's approval through.
+- The thread-write gate matches `reply` / `resolve` in any argument order (`land-it threads --body x reply T`).
+- `land-it threads resolve ID`; if `--resolve` fails after the reply posted, the error says so and points to
+  `resolve` instead of inviting a second identical reply. A null GraphQL payload is a clean error, not a traceback.
+- Outdated threads keep their location (`originalLine` when GitHub nulls `line`). A PR can be given as N, #N or a URL.
+- `sweep-target`: a glob's static prefix is used only if it exists; otherwise the common parent of what it matches
+  (a slash-less `billing` → `src/billing`).
+- `eval scan` skips reapplies (a revert of a revert) and shares one revert detector with the circuit breaker.
+- `github_stats` uses the shared `gh` runner.
+- Won't fix: gating direct `gh api` / `gh pr comment` writes. The gate exists because land-it's skills pre-approve
+  `Bash(land-it *)`; direct `gh` writes aren't pre-approved, so Claude Code's own permission prompt covers them.
+
 ## 0.6.0
 
 - `/land-it:respond` and `land-it threads [PR | reply ID --body B --resolve]`: every unresolved review thread on a PR
