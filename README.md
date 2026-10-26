@@ -100,7 +100,7 @@ flowchart TD
 ```
 
 - `--scope project` records the plugin in `.claude/settings.json`, so everyone who clones the repo gets it.
-  The hooks stay silent in repositories without `.claude/land-it.json`, so a user-scope install is safe too.
+  The hooks stay silent in repositories without `.land-it/config.json`, so a user-scope install is safe too.
 - `/land-it:trust` approves the commands init wrote. Only you can run it; see [Trust](#trust).
 
 Requirements: git, Python 3.9+ (stdlib only, nothing to install), a recent Claude Code (tested on 2.1.300).
@@ -120,7 +120,7 @@ Requirements: git, Python 3.9+ (stdlib only, nothing to install), a recent Claud
 
 | Command | What it does |
 |---|---|
-| `/land-it:init` | Reads the project and writes `.claude/land-it.json` (checks, on-edit formatters, risk paths), a repo-specific `REVIEW.md`, the `@REVIEW.md` import in CLAUDE.md, and a PR template. Optionally a GitHub review + security workflow (`--ci`), a nightly bug sweep (`--sweep`) and branch protection (`--protect`); both ask before touching GitHub |
+| `/land-it:init` | Reads the project and writes `.land-it/config.json` (checks, on-edit formatters, risk paths), a repo-specific `REVIEW.md`, the `@REVIEW.md` import in CLAUDE.md, and a PR template. Optionally a GitHub review + security workflow (`--ci`), a nightly bug sweep (`--sweep`) and branch protection (`--protect`); both ask before touching GitHub |
 | `/land-it:preflight` | The pre-PR pipeline: risk tier → review round → checks → simplify → code review → security review → behavior check → findings ledger → stamp → PR body |
 | `/land-it:eval` | `add`: record the commit behind an incident as a case. `run`: review every case under today's rules, score recall and noise, compare with the last run. `list` |
 | `/land-it:trust` | Approve the config's commands. Only a command you type counts; Claude can't invoke it |
@@ -156,7 +156,9 @@ Requirements: git, Python 3.9+ (stdlib only, nothing to install), a recent Claud
 | `PreToolUse` (Bash) | `gh pr create` needs the stamp on HEAD's tree; `gh pr review --approve` is denied; `gh pr merge` asks you unless HEAD is stamped low; `land-it trust` and `land-it ci-verdict` from Claude's shell are denied; `land-it threads reply` and `resolve` always ask you, because they act under your account. Every deny is checked before any ask, so a combined command can't slip a deny through a prompt |
 | `UserPromptExpansion` | When *you* type `/land-it:trust`, records trust for the current commands |
 
-## Configuration: `.claude/land-it.json`
+## Configuration: `.land-it/config.json`
+
+The same file serves every agent runtime. Repos set up with 0.1–0.8 have it at `.claude/land-it.json`: it's still read, and `land-it config migrate` moves it (trust carries over). Both at once is an error. Keys and types are checked on load: a misspelt key gets a "did you mean", and a `stop_checks` entry that names no check is refused, since either would quietly switch a gate off. `land-it config` validates it; `land-it doctor` checks the whole setup.
 
 ```json
 {
@@ -193,7 +195,7 @@ without `/` matches at any depth, and a directory pattern covers everything unde
 
 ## Trust
 
-The hooks run commands from `.claude/land-it.json`. Without a guard, editing that file would be a way to run
+The hooks run commands from `.land-it/config.json`. Without a guard, editing that file would be a way to run
 commands: in a mode that auto-accepts edits, Claude (say, misled by a prompt injection in the code it reads)
 could write a new "check", and the Stop hook would run it without a Bash permission prompt.
 
@@ -255,6 +257,8 @@ The plugin puts `land-it` on Claude's PATH; the skills call it. You can call it 
 | `land-it stamp [--tier T]` | Bind the green tree and its tier; refuses on open findings, missing review stages, an unknown base or a tier below the floor |
 | `land-it status` | Trust, green and stamp state for the worktree and HEAD |
 | `land-it trust` | Approve the config's commands, at your own terminal |
+| `land-it config [migrate]` | Where the config is and whether it's valid; `migrate` moves `.claude/land-it.json` to `.land-it/config.json` |
+| `land-it doctor` | Tools, repository, config, trust, base branch, history depth, review rules, project install: one line each, with the fix |
 | `land-it eval [list \| scan \| add … \| run …]` | Reviewer evals; `scan` finds reverts that aren't cases yet |
 | `land-it threads [PR \| reply ID --body B [--resolve] \| resolve ID]` | Unresolved review threads on a PR (given as N, #N or a URL; bots told apart); reply to one, resolve one |
 | `land-it sweep-target [--day N]` | Today's area for the sweep, rotating over `risk.high` |
@@ -265,7 +269,7 @@ The plugin puts `land-it` on Claude's PATH; the skills call it. You can call it 
 
 | Path | Committed | What |
 |---|---|---|
-| `.claude/land-it.json` | yes | Checks, on-edit commands, risk paths, rounds, effort |
+| `.land-it/config.json` | yes | Checks, on-edit commands, risk paths, rounds, effort |
 | `REVIEW.md`, `.github/pull_request_template.md` | yes | Review rules, PR template |
 | `.land-it/evals/` | yes | Eval cases and `history.jsonl` |
 | `.git/land-it/` | no | Per-worktree state: green tree, stamp, turn snapshots, per-branch rounds and findings |
@@ -277,6 +281,7 @@ The plugin puts `land-it` on Claude's PATH; the skills call it. You can call it 
 - The gates cover Claude's tool calls. You can still run `gh pr create` yourself; that's deliberate.
 - The Bash gates match command text (the usual `gh pr …` forms, `-R/--repo` included), not a parsed shell. They mirror GitHub's branch protection and required checks, which is where enforcement that must hold belongs. The policy hook fails closed: if it crashes or times out, the command is blocked.
 - Pull requests from forks get no secrets and a read-only token in GitHub Actions, so their CI review ends in `error`.
+- Codex: the hook adapter (`land-it hook … --runtime codex`) is in place and tested against Codex's documented payloads (`apply_patch` edits, no `ask`, trust by typing `land-it trust`); the Codex package itself comes in 1.0.
 - Tested on macOS. Windows is untested: hooks call `python3`, and there's no state lock (no `fcntl`).
 - `/security-review` needs `origin/HEAD`; without a remote, preflight runs the security pass in a fresh subagent.
 - Eval recall counts any `file:line` the review cites near the recorded bug; noise counts every cited location.
@@ -288,7 +293,7 @@ python3 -m unittest discover tests     # stdlib only, throwaway git repos
 claude plugin validate . --strict
 ```
 
-This repo uses land-it on itself: see [.claude/land-it.json](.claude/land-it.json).
+This repo uses land-it on itself: see [.land-it/config.json](.land-it/config.json).
 Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## License

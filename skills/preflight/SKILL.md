@@ -8,7 +8,7 @@ allowed-tools: Bash(land-it *), Bash(git status*), Bash(git diff*), Bash(git log
 # land-it preflight
 
 Talk to the user in their language. If `land-it` isn't on PATH, call
-`python3 ${CLAUDE_PLUGIN_ROOT}/bin/land-it` instead. No `.claude/land-it.json` → offer `/land-it:init` and stop.
+`python3 ${CLAUDE_PLUGIN_ROOT}/bin/land-it` instead. No `.land-it/config.json` → offer `/land-it:init` and stop.
 
 The rule underneath every step: **show evidence, don't claim it.** Paste the PASS/FAIL lines, the
 finding counts, the commands. "Tests pass" without output is not a step done.
@@ -16,7 +16,7 @@ finding counts, the commands. "Tests pass" without output is not a step done.
 ## 1. Risk tier
 
 `land-it risk` gives the floor from the changed paths. If it says it can't find the base branch, stop and ask
-which branch the PR targets (then set `"base"` in `.claude/land-it.json`): an unknown base is not an empty diff. Read the diff and **raise** the tier (never lower it)
+which branch the PR targets (then set `"base"` in `.land-it/config.json`): an unknown base is not an empty diff. Read the diff and **raise** the tier (never lower it)
 when the content is riskier than its path: auth, permissions, billing, data migrations or deletes, concurrency,
 crypto, secrets, public API contracts, installers and auto-updaters, system prompts → high. Tell the user
 the tier and the reason in one line. If `circuit_breaker.tripped` is true, the floor is already one tier

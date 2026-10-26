@@ -1,5 +1,5 @@
 # land-it sweep: every night, review one high-risk area of existing code and file new bugs as an issue.
-# Rotates over the repo's risk.high areas in .claude/land-it.json (or its top-level source directories).
+# Rotates over the repo's risk.high areas in .land-it/config.json (or its top-level source directories).
 # Secrets: CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`) or ANTHROPIC_API_KEY.
 # Install the Claude GitHub App first: https://github.com/apps/claude (or run /install-github-app).
 name: land-it sweep
@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: false  # let a running sweep finish; the next night picks the next area
 
 env:
-  LAND_IT_REF: v0.8.0  # the land-it release this workflow runs; /land-it:init writes the installed one
+  LAND_IT_REF: v0.9.0  # the land-it release this workflow runs; /land-it:init writes the installed one
 
 jobs:
   sweep:

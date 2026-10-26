@@ -7,6 +7,7 @@ review, how to fix) lives in the skills. Stdlib only, Python 3.9+.
 import argparse
 import contextlib
 import datetime
+import difflib
 import functools
 import hashlib
 import json
@@ -25,7 +26,7 @@ try:
 except ImportError:  # ponytail: no state lock on Windows; parallel hooks may drop a dirty mark
     fcntl = None
 
-CONFIG = ".claude/land-it.json"
+CONFIGS = (".land-it/config.json", ".claude/land-it.json")  # provider-neutral first; the 0.1-0.8 path still works
 TAIL = 4000  # chars of failing output handed back to Claude
 MAX_STOP_BLOCKS = 3
 DAY = 86400
@@ -65,18 +66,78 @@ def find_root(cwd):
     return r.stdout.strip() if r.returncode == 0 else None
 
 
+def config_path(root):
+    found = [c for c in CONFIGS if os.path.exists(os.path.join(root, c))]
+    if len(found) > 1:
+        die("both %s and %s exist; keep one (`land-it config migrate` moves the old one)" % tuple(found))
+    return found[0] if found else None
+
+
 def load_config(root):
-    path = os.path.join(root, CONFIG)
-    if not os.path.exists(path):
+    rel = config_path(root)
+    if rel is None:
         return None
-    with open(path) as f:
+    with open(os.path.join(root, rel)) as f:
         try:
             cfg = json.load(f)
         except ValueError as e:
-            die("%s isn't valid JSON: %s" % (CONFIG, e))
+            die("%s isn't valid JSON: %s" % (rel, e))
     if not isinstance(cfg, dict):
-        die("%s must be a JSON object" % CONFIG)
+        die("%s must be a JSON object" % rel)
+    problems = config_problems(cfg)
+    if problems:
+        die("%s: %s" % (rel, "; ".join(problems)))
     return cfg
+
+
+def config_problems(cfg):
+    """Typos and wrong types, caught at load: a misspelt key or check name would quietly switch a gate off."""
+    known = {"checks", "on_edit", "stop_checks", "stop_gate", "risk", "max_rounds", "review_effort", "base",
+             "circuit_breaker", "required_stages"}
+    out, is_strs = [], lambda v: isinstance(v, list) and all(isinstance(x, str) for x in v)
+    for k in cfg:
+        if k not in known:
+            close = difflib.get_close_matches(k, known, 1)
+            out.append("unknown key %r%s" % (k, " (did you mean %r?)" % close[0] if close else ""))
+    checks = cfg.get("checks", {})
+    if not isinstance(checks, dict):
+        out.append("checks must map a name to a command")
+        checks = {}
+    for name, spec in checks.items():
+        if not (isinstance(spec, str) or (isinstance(spec, dict) and isinstance(spec.get("run"), str)
+                                          and set(spec) <= {"run", "paths"} and is_strs(spec.get("paths", [])))):
+            out.append("checks.%s must be a command or {\"run\": \"...\", \"paths\": [globs]}" % name)
+    if not (isinstance(cfg.get("on_edit", {}), dict) and all(isinstance(v, str) for v in cfg.get("on_edit", {}).values())):
+        out.append("on_edit must map a glob to a command")
+    stop = cfg.get("stop_checks", [])
+    if not is_strs(stop):
+        out.append("stop_checks must be a list of check names")
+    else:
+        out += ["stop_checks names %r, which isn't a check" % n for n in stop if n not in checks]
+    if not isinstance(cfg.get("stop_gate", True), bool):
+        out.append("stop_gate must be true or false")
+    for key, values in (("risk", None), ("review_effort", ["low", "medium", "high", "xhigh", "max"]),
+                        ("required_stages", STAGES)):
+        v = cfg.get(key, {})
+        if not isinstance(v, dict) or set(v) - set(TIERS):
+            out.append("%s must be keyed by tier (%s)" % (key, ", ".join(TIERS)))
+            continue
+        for tier, x in v.items():
+            if values is None and not is_strs(x):
+                out.append("risk.%s must be a list of globs" % tier)
+            elif key == "review_effort" and x not in values:
+                out.append("review_effort.%s must be one of %s" % (tier, ", ".join(values)))
+            elif key == "required_stages" and not (is_strs(x) and set(x) <= set(values)):
+                out.append("required_stages.%s must list stages from %s" % (tier, ", ".join(values)))
+    if not (isinstance(cfg.get("max_rounds", 1), int) and cfg.get("max_rounds", 1) >= 1):
+        out.append("max_rounds must be a whole number of at least 1")
+    if not isinstance(cfg.get("base", ""), str):
+        out.append("base must be a branch name")
+    cb = cfg.get("circuit_breaker", {})
+    if cb is not False and not (isinstance(cb, dict) and set(cb) <= set(BREAKER)
+                                and cb.get("mode", "observe") in ("observe", "enforce")):
+        out.append("circuit_breaker must be false or an object with %s; mode is observe or enforce" % ", ".join(BREAKER))
+    return out
 
 
 def tail(text, n=TAIL):
@@ -125,9 +186,9 @@ def command_lines(cfg):
 
 
 def untrusted_message(cfg):
-    return ("land-it: the commands in %s are new or changed since they were last trusted, so they didn't run:\n  %s\n"
-            "Review them, then type /land-it:trust. Only the user can; Claude can't approve them."
-            % (CONFIG, "\n  ".join(command_lines(cfg))))
+    return ("land-it: the land-it config's commands are new or changed since they were last trusted, so they "
+            "didn't run:\n  %s\nReview them, then type /land-it:trust. Only the user can; the agent can't approve them."
+            % "\n  ".join(command_lines(cfg)))
 
 
 # --- globs -----------------------------------------------------------------
@@ -218,8 +279,10 @@ def head_tree(root):
 
 TIERS = ["low", "medium", "high"]
 # Config can't lower these: CI and the gate's own config decide what every other change must pass.
-ALWAYS_HIGH = [".github/workflows/**", ".gitlab-ci.yml", "CODEOWNERS", CONFIG]
-DEFAULT_RISK = {"medium": ["CLAUDE.md", "REVIEW.md", ".claude/**"], "low": ["*.md", "docs/**", "LICENSE*"]}
+ALWAYS_HIGH = [".github/workflows/**", ".gitlab-ci.yml", "CODEOWNERS", *CONFIGS]
+# files that steer an agent are never low, though they end in .md
+DEFAULT_RISK = {"medium": ["CLAUDE.md", "AGENTS.md", "REVIEW.md", ".claude/**", ".codex/**", ".agents/**", ".mcp.json"],
+                "low": ["*.md", "docs/**", "LICENSE*"]}
 # /code-review effort per tier, the repo's Quick/Standard/Deep. `max` fans out to dozens of
 # agents (40+ minutes even on a tiny diff), so it's opt-in through `review_effort`.
 REVIEW_EFFORT = {"low": "low", "medium": "medium", "high": "high"}
@@ -305,7 +368,7 @@ def changed_files_or_die(root, cfg):
     files = changed_files(root, cfg)
     if files is None:
         die("can't find the base branch to compare with (tried %s); set \"base\" in %s"
-            % (cfg.get("base") or "origin/HEAD, main, master", CONFIG))
+            % (cfg.get("base") or "origin/HEAD, main, master", "the land-it config"))
     return files
 
 
@@ -451,7 +514,7 @@ def run_checks(root, cfg, only=None, files=None):
         if r.returncode:
             return False, skipped, "\n".join(log)
     if not specs:
-        log.append("== no checks configured in %s" % CONFIG)
+        log.append("== no checks configured")
     return True, skipped, "\n".join(log)
 
 
@@ -638,7 +701,7 @@ def cmd_status(root, cfg, a):
 # --- evals: past incidents become test cases for the reviewer ------------------------
 
 EVAL_DIR = ".land-it/evals"
-GUIDANCE = ["CLAUDE.md", "REVIEW.md", CONFIG]  # what a reviewer change usually edits
+GUIDANCE = ["CLAUDE.md", "AGENTS.md", "REVIEW.md"]  # what a reviewer change usually edits
 READ_ONLY_TOOLS = "Read,Grep,Glob,Agent,Bash(git diff *),Bash(git log *),Bash(git show *),Bash(git blame *)"
 LOC = re.compile(r"([\w@+-][\w./@+-]*\.\w+):(\d+)")
 
@@ -704,7 +767,8 @@ def run_reviewer(wt, rng, a):
         cmd, shell = ["claude", "-p", "/code-review %s %s" % (a.effort, rng), "--output-format", "text"], False
         cmd += (["--model", a.model] if a.model else []) + ["--allowedTools", READ_ONLY_TOOLS]
     try:
-        r = subprocess.run(cmd, shell=shell, cwd=wt, capture_output=True, text=True, timeout=a.timeout)
+        r = subprocess.run(cmd, shell=shell, cwd=wt, capture_output=True, text=True, timeout=a.timeout,
+                           env=dict(os.environ, LAND_IT_HOOKS_OFF="1"))
     except subprocess.TimeoutExpired:
         return 124, "timed out after %ds" % a.timeout
     return r.returncode, r.stdout + ("\n" + r.stderr if r.returncode else "")
@@ -1051,10 +1115,124 @@ def cmd_ci_verdict(root, cfg, a):
     sys.exit({"success": 0, "failure": 1}.get(state, 2))
 
 
+# --- config and doctor ------------------------------------------------------------
+
+def cmd_config(root, cfg, a):
+    rel = config_path(root)
+    if a.action == "migrate":
+        if rel == CONFIGS[0]:
+            print(json.dumps({"path": rel, "migrated": False}, indent=1))
+            return
+        os.makedirs(os.path.join(root, os.path.dirname(CONFIGS[0])), exist_ok=True)
+        os.rename(os.path.join(root, rel), os.path.join(root, CONFIGS[0]))  # trust is per repo and commands: it stays
+        rel = CONFIGS[0]
+        print(json.dumps({"path": rel, "migrated": True, "next": "commit the move"}, indent=1))
+        return
+    print(json.dumps({"path": rel, "valid": True, "checks": [n for n, _, _ in check_specs(cfg)]}, indent=1))
+
+
+def cmd_doctor():
+    """What's set up, what's missing, and the fix for each: one line per item."""
+    rows = []
+    add = lambda state, item, note="": rows.append((state, item, note))
+    run = lambda *c: subprocess.run(c, capture_output=True, text=True)
+    py_ok = sys.version_info >= (3, 9)
+    add("ok" if py_ok else "FAIL", "python %d.%d" % sys.version_info[:2], "" if py_ok else "3.9+ needed")
+    add("ok", "git", run("git", "--version").stdout.strip()) if shutil.which("git") else add("FAIL", "git", "install git")
+    if not shutil.which("gh"):
+        add("warn", "gh", "missing: respond, stats --github and CI publishing need the GitHub CLI")
+    else:
+        authed = run("gh", "auth", "status").returncode == 0
+        add("ok" if authed else "warn", "gh auth", "" if authed else "`gh auth login`")
+    add("ok" if shutil.which("claude") else "warn", "claude CLI", "" if shutil.which("claude") else
+        "missing: `eval run` uses it as the default reviewer")
+    root = find_root(os.getcwd())
+    if not root:
+        add("FAIL", "git repository", "run land-it inside one (git init)")
+        return doctor_report(rows)
+    add("ok", "repository", root)
+    found = [c for c in CONFIGS if os.path.exists(os.path.join(root, c))]
+    if len(found) > 1:
+        add("FAIL", "config", "both %s and %s exist; `land-it config migrate` keeps one" % tuple(found))
+        return doctor_report(rows)
+    if not found:
+        add("FAIL", "config", "none; run /land-it:init")
+        return doctor_report(rows)
+    with open(os.path.join(root, found[0])) as f:
+        try:
+            problems = config_problems(json.load(f))
+        except ValueError as e:
+            problems = ["not valid JSON: %s" % e]
+    if problems:
+        for p in problems:
+            add("FAIL", "config " + found[0], p)
+        return doctor_report(rows)
+    cfg = load_config(root)
+    add("ok" if found[0] == CONFIGS[0] else "warn", "config " + found[0],
+        "" if found[0] == CONFIGS[0] else "old location: `land-it config migrate`")
+    add("ok" if is_trusted(root, cfg) else "warn", "commands trusted", "" if is_trusted(root, cfg) else
+        "type /land-it:trust (Codex: `land-it trust` as a prompt) after reviewing them")
+    base = merge_base(root, cfg)
+    add("ok" if base else "FAIL", "base branch", base_ref(root, cfg) if base else 'not found: set "base" in the config')
+    if git(root, "rev-parse", "--is-shallow-repository", check=False) == "true":
+        add("warn", "history", "shallow clone: blame hints, rounds and evals need full history (`git fetch --unshallow`)")
+    review = os.path.exists(os.path.join(root, "REVIEW.md"))
+    imports = any("REVIEW.md" in open(os.path.join(root, f)).read()
+                  for f in ("CLAUDE.md", ".claude/CLAUDE.md", "AGENTS.md") if os.path.exists(os.path.join(root, f)))
+    add("ok" if review and imports else "warn", "review rules",
+        "" if review and imports else "REVIEW.md missing, or not referenced from CLAUDE.md / AGENTS.md: /land-it:init")
+    try:
+        with open(os.path.join(root, ".claude", "settings.json")) as f:
+            enabled = any(k.startswith("land-it@") for k in (json.load(f).get("enabledPlugins") or {}))
+    except (OSError, ValueError):
+        enabled = False
+    add("ok" if enabled else "warn", "plugin in project settings",
+        "" if enabled else "not in .claude/settings.json; teammates won't get it (install with --scope project)")
+    return doctor_report(rows)
+
+
+def doctor_report(rows):
+    for state, item, note in rows:
+        print("%-5s %-28s %s" % (state, item, note))
+    sys.exit(1 if any(state == "FAIL" for state, _, _ in rows) else 0)
+
+
 # --- hooks -------------------------------------------------------------------
 
+RUNTIME, EVENT = "claude", ""  # set by run_hook
+EVENTS = {"post-edit": "PostToolUse", "stop": "Stop", "pre-bash": "PreToolUse", "prompt": "UserPromptSubmit",
+          "expand": "UserPromptExpansion"}
+PATCH_FILES = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$|^\*\*\* Move to: (.+?)\s*$", re.M)
+TRUST_PROMPT = re.compile(r"\s*/?land-it[\s:-]+trust\s*\Z", re.I)
+
+
+def edited_paths(data):
+    """Claude's Edit/Write name one file_path; Codex's apply_patch carries its files inside the patch text."""
+    ti = data.get("tool_input") or {}
+    if ti.get("file_path"):
+        return [ti["file_path"]]
+    if data.get("tool_name") == "apply_patch":
+        return [a or b for a, b in PATCH_FILES.findall(ti.get("command") or "")]
+    return []
+
+
+def codex_output(obj):
+    """Codex hooks can't `ask` on PreToolUse and have no systemMessage; context goes where Codex accepts it."""
+    hso = obj.get("hookSpecificOutput") or {}
+    if hso.get("permissionDecision") == "ask":
+        hso["permissionDecision"] = "deny"
+        hso["permissionDecisionReason"] += " (Codex hooks can't ask; if you agree, run it yourself.)"
+    msg = obj.pop("systemMessage", None)
+    if msg and not obj and EVENT in ("PostToolUse", "PreToolUse", "UserPromptSubmit"):
+        obj = {"hookSpecificOutput": {"hookEventName": EVENT, "additionalContext": msg}}
+    return obj
+
+
 def emit(obj):
-    print(json.dumps(obj))
+    if RUNTIME == "codex":
+        obj = codex_output(obj)
+    if obj:
+        print(json.dumps(obj))
     sys.exit(0)
 
 
@@ -1071,6 +1249,11 @@ def settle(st, sid, tree):
 
 def hook_prompt(data, root, cfg):
     """A new turn is judged on its own changes, so the user's edits between turns aren't Claude's."""
+    if RUNTIME == "codex" and TRUST_PROMPT.match(data.get("prompt") or ""):
+        # Codex has no UserPromptExpansion: the user typing `land-it trust` is the signal; the model never sees it
+        record_trust(root, cfg)
+        emit({"decision": "block", "reason": "land-it: trusted these commands for %s:\n  %s"
+              % (root, "\n  ".join(command_lines(cfg)) or "(none)")})
     if cfg.get("stop_gate") is False:
         return
     tree, now = worktree_tree(root), int(time.time())
@@ -1091,12 +1274,13 @@ def hook_expand(data, root, cfg):
 
 
 def hook_post_edit(data, root, cfg):
-    path = (data.get("tool_input") or {}).get("file_path")
-    if not path:
-        return
-    path = os.path.join(data.get("cwd") or root, path)
-    rel = os.path.relpath(os.path.realpath(path), os.path.realpath(root))
-    if rel.startswith(".."):
+    edits = []
+    for p in edited_paths(data):
+        path = os.path.join(data.get("cwd") or root, p)
+        rel = os.path.relpath(os.path.realpath(path), os.path.realpath(root))
+        if not rel.startswith(".."):
+            edits.append((rel, path))
+    if not edits:
         return
     sid, now = data.get("session_id", "?"), int(time.time())
     on_edit, trusted = cfg.get("on_edit") or {}, is_trusted(root, cfg)
@@ -1106,8 +1290,7 @@ def hook_post_edit(data, root, cfg):
         prune(warned, now)
         entry = dirty.setdefault(sid, {"files": []})
         entry["at"] = now
-        if rel not in entry["files"]:
-            entry["files"].append(rel)
+        entry["files"] += [rel for rel, _ in edits if rel not in entry["files"]]
         first_warning = on_edit and not trusted and sid not in warned
         if first_warning:
             warned[sid] = {"at": now}
@@ -1116,17 +1299,18 @@ def hook_post_edit(data, root, cfg):
             emit({"systemMessage": untrusted_message(cfg)})
         return
     problems = []
-    for pat, cmd in on_edit.items():
-        if matches(pat, rel) and os.path.exists(path):
-            # the path goes in through the environment, so no quoting in the user's command can make it code
-            cmd = cmd.replace("{file}", '"$LAND_IT_FILE"')
-            r = subprocess.run(cmd, shell=True, cwd=root, env=dict(os.environ, LAND_IT_FILE=path),
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            if r.returncode:
-                problems.append("$ %s\n%s" % (cmd, tail(r.stdout, 1500)))
+    for rel, path in edits:
+        for pat, cmd in on_edit.items():
+            if matches(pat, rel) and os.path.exists(path):
+                # the path goes in through the environment, so no quoting in the user's command can make it code
+                cmd = cmd.replace("{file}", '"$LAND_IT_FILE"')
+                r = subprocess.run(cmd, shell=True, cwd=root, env=dict(os.environ, LAND_IT_FILE=path),
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                if r.returncode:
+                    problems.append("%s: $ %s\n%s" % (rel, cmd, tail(r.stdout, 1500)))
     if problems:
-        emit({"decision": "block", "reason": "land-it on_edit failed for %s; fix it before moving on:\n\n%s"
-              % (rel, "\n\n".join(problems))})
+        emit({"decision": "block", "reason": "land-it on_edit failed; fix it before moving on:\n\n%s"
+              % "\n\n".join(problems)})
 
 
 def hook_stop(data, root, cfg):
@@ -1234,18 +1418,22 @@ def cmd_trust(root, cfg, a):
     """For a terminal outside Claude Code; inside it, the user types /land-it:trust."""
     if os.environ.get("CLAUDECODE") or not sys.stdin.isatty():
         die("trust needs you at a terminal; in Claude Code, type /land-it:trust instead")
-    print("Commands in %s for %s:\n  %s" % (CONFIG, root, "\n  ".join(command_lines(cfg)) or "(none)"))
+    print("Commands in %s for %s:\n  %s" % (config_path(root), root, "\n  ".join(command_lines(cfg)) or "(none)"))
     if input("Trust these commands? [y/N] ").strip().lower() not in ("y", "yes"):
         die("not trusted")
     record_trust(root, cfg)
     print("trusted")
 
 
-def run_hook(event):
-    # Claude Code exports CLAUDE_PLUGIN_ROOT to hook processes, not to commands Claude runs through Bash.
-    # Without this, `echo '{"command_name": "land-it:trust"}' | land-it hook expand` would let Claude trust itself.
-    if not os.environ.get("CLAUDE_PLUGIN_ROOT"):
-        die("`land-it hook` is the entry point for hooks/hooks.json; it doesn't run from a shell")
+def run_hook(event, runtime="claude"):
+    global RUNTIME, EVENT
+    RUNTIME, EVENT = runtime, EVENTS[event]
+    if os.environ.get("LAND_IT_HOOKS_OFF"):  # land-it's own nested reviewer runs (evals)
+        return
+    # Claude Code and Codex export the plugin root to hook processes, not to commands the agent runs through Bash.
+    # Without this, `echo '{"command_name": "land-it:trust"}' | land-it hook expand` would let the agent trust itself.
+    if not (os.environ.get("CLAUDE_PLUGIN_ROOT") or os.environ.get("PLUGIN_ROOT")):
+        die("`land-it hook` is the entry point for the plugin's hooks; it doesn't run from a shell")
     try:
         data = json.load(sys.stdin)
     except ValueError:
@@ -1312,17 +1500,23 @@ def main(argv=None):
     st.add_argument("--github", action="store_true", help="add merged-PR metrics from `gh`")
     h = sub.add_parser("hook", help="entry point for hooks/hooks.json")
     h.add_argument("event", choices=sorted(HOOKS))
+    h.add_argument("--runtime", choices=["claude", "codex"], default="claude")
+    cf = sub.add_parser("config", help="where the config is, whether it's valid; migrate moves it to .land-it/")
+    cf.add_argument("action", nargs="?", default="check", choices=["check", "migrate"])
+    sub.add_parser("doctor", help="check the setup: tools, repo, config, trust, base, review rules")
     a = p.parse_args(argv)
     if a.cmd == "hook":
-        return run_hook(a.event)
+        return run_hook(a.event, a.runtime)
+    if a.cmd == "doctor":
+        return cmd_doctor()
     root = find_root(os.getcwd()) or die("not inside a git repository")
     cfg = load_config(root)
     if cfg is None:
-        die("no %s here; run /land-it:init" % CONFIG)
+        die("no land-it config here (%s); run /land-it:init" % CONFIGS[0])
     {"check": cmd_check, "risk": cmd_risk, "round": cmd_round, "findings": cmd_findings, "stage": cmd_stage,
      "stamp": cmd_stamp, "status": cmd_status, "eval": cmd_eval, "trust": cmd_trust,
      "stats": cmd_stats, "threads": cmd_threads, "sweep-target": cmd_sweep_target,
-     "ci-verdict": cmd_ci_verdict}[a.cmd](root, cfg, a)
+     "ci-verdict": cmd_ci_verdict, "config": cmd_config}[a.cmd](root, cfg, a)
 
 
 if __name__ == "__main__":

@@ -63,10 +63,10 @@ class Repo:
         return subprocess.run([sys.executable, BIN, *args], cwd=self.root, input=stdin, capture_output=True, text=True,
                               env=env)
 
-    def hook(self, event, **data):
+    def hook(self, event, runtime=None, **data):
         data.setdefault("cwd", self.root)
         data.setdefault("session_id", "s1")
-        r = self.cli("hook", event, stdin=json.dumps(data))
+        r = self.cli("hook", event, *(["--runtime", runtime] if runtime else []), stdin=json.dumps(data))
         assert r.returncode == 0, r.stderr
         return json.loads(r.stdout) if r.stdout.strip() else None
 
@@ -665,7 +665,7 @@ class AuditRegressions(unittest.TestCase):
         with open(sentinel) as f:
             self.assertEqual(f.read(), "untouched")
 
-    def test_r10_eval_refuses_a_symlinked_directory(self):
+    def test_r10_eval_with_a_symlinked_directory_writes_nothing_outside(self):
         r = Repo(self, {})
         outside = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, outside)
@@ -674,9 +674,17 @@ class AuditRegressions(unittest.TestCase):
         os.rename(os.path.join(r.root, ".claude-real"), os.path.join(r.root, ".claude"))
         r.commit("real .claude")
         r.cli("eval", "add", "--commit", bad, "--file", "a.py", "--line", "1", "--summary", "x")
-        out = r.cli("eval", "run", "--reviewer", "echo a.py:1")
-        self.assertIn("unsafe path", out.stdout)
+        r.cli("eval", "run", "--reviewer", "echo a.py:1")
         self.assertEqual(os.listdir(outside), [], "nothing written outside the checkout")
+
+    def test_r10_overlay_refuses_a_symlinked_parent_directory(self):
+        wt, outside = tempfile.mkdtemp(), tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, wt)
+        self.addCleanup(shutil.rmtree, outside)
+        os.symlink(outside, os.path.join(wt, "d"))
+        self.assertFalse(LI.overlay(wt, "d/REVIEW.md", __file__))
+        self.assertEqual(os.listdir(outside), [])
+        self.assertTrue(LI.overlay(wt, "REVIEW.md", __file__))
 
     def test_e07_eval_ids_and_lines_are_validated(self):
         r = Repo(self, {})
@@ -878,6 +886,115 @@ class CIVerdict(unittest.TestCase):
         code, out = self.verdict("--dry-run")
         self.assertEqual((code, out["state"]), (0, "success"))
         self.assertEqual(self.statuses(), [])
+
+
+
+class Config(unittest.TestCase):
+    def test_the_provider_neutral_path_and_migration(self):
+        r = Repo(self, {"checks": {"ok": "true"}})
+        self.assertEqual(json.loads(r.cli("config").stdout)["path"], ".claude/land-it.json")
+        out = json.loads(r.cli("config", "migrate").stdout)
+        self.assertEqual((out["path"], out["migrated"]), (".land-it/config.json", True))
+        self.assertTrue(json.loads(r.cli("status").stdout)["commands_trusted"], "trust carries over")
+        r.write(".claude/land-it.json", "{}")
+        out = r.cli("risk")
+        self.assertIn("both .land-it/config.json and .claude/land-it.json", out.stderr)
+
+    def test_typos_and_wrong_types_are_caught(self):
+        r = Repo(self, {})
+        for cfg, expect in (({"chekcs": {}}, "did you mean 'checks'"),
+                            ({"checks": {"t": "true"}, "stop_checks": ["test"]}, "'test', which isn't a check"),
+                            ({"review_effort": {"high": "huge"}}, "review_effort.high"),
+                            ({"risk": {"severe": ["x"]}}, "keyed by tier"),
+                            ({"checks": {"t": {"cmd": "true"}}}, "checks.t"),
+                            ({"circuit_breaker": {"mode": "panic"}}, "circuit_breaker"),
+                            ({"max_rounds": 0}, "max_rounds")):
+            r.write(".claude/land-it.json", json.dumps(cfg))
+            out = r.cli("risk")
+            self.assertNotEqual(out.returncode, 0, cfg)
+            self.assertIn(expect, out.stderr, cfg)
+
+    def test_agent_instruction_files_are_never_low(self):
+        for path in ("AGENTS.md", "docs/AGENTS.md", ".codex/hooks.json", ".mcp.json", ".land-it/config.json"):
+            self.assertNotEqual(LI.file_tier(path, {}), "low", path)
+        self.assertEqual(LI.file_tier(".land-it/config.json", {}), "high")
+
+
+class Doctor(unittest.TestCase):
+    def doctor(self, r):
+        out = r.cli("doctor")
+        return out.returncode, {ln.split()[1] if len(ln.split()) > 1 else "": ln.split()[0]
+                                for ln in out.stdout.splitlines() if ln.strip()}, out.stdout
+
+    def test_a_working_setup(self):
+        r = Repo(self, {"checks": {"ok": "true"}})
+        code, rows, text = self.doctor(r)
+        self.assertEqual(code, 0, text)
+        self.assertEqual(rows.get("commands"), "ok")
+        self.assertEqual(rows.get("base"), "ok")
+        self.assertIn("old location", text, "points at the provider-neutral path")
+
+    def test_what_blocks(self):
+        r = Repo(self, {"checks": {"ok": "true"}}, trust=False)
+        self.assertEqual(self.doctor(r)[1].get("commands"), "warn")
+        r.write(".claude/land-it.json", '{"stop_cheks": []}')
+        code, _, text = self.doctor(r)
+        self.assertEqual(code, 1)
+        self.assertIn("did you mean 'stop_checks'", text)
+        os.remove(os.path.join(r.root, ".claude/land-it.json"))
+        self.assertIn("run /land-it:init", self.doctor(r)[2])
+
+
+PATCH = """*** Begin Patch
+*** Update File: src/a.py
+@@
+-x = 1
++x = 2
+*** Add File: src/new.py
++print("hi")
+*** Update File: old/name.py
+*** Move to: src/moved.py
+*** End Patch"""
+
+
+class CodexRuntime(unittest.TestCase):
+    """The hook payloads and outputs documented for Codex: same fields, different edges."""
+
+    def test_apply_patch_files_get_on_edit_and_the_stop_gate(self):
+        r = Repo(self, {"checks": {"t": "false"}, "on_edit": {"*.py": "grep -q print {file}"}})
+        for path in ("src/a.py", "src/new.py", "src/moved.py"):
+            r.write(path, "x = 2\n")
+        out = r.hook("post-edit", runtime="codex", tool_name="apply_patch", tool_input={"command": PATCH})
+        self.assertEqual(out["decision"], "block", "on_edit ran on the patch's files")
+        for path in ("src/a.py", "src/moved.py"):
+            self.assertIn(path, out["reason"])
+        self.assertEqual(r.hook("stop", runtime="codex")["decision"], "block")
+
+    def test_ask_becomes_deny_and_messages_fit_codex(self):
+        r = Repo(self, {"checks": {"ok": "true"}})
+        out = r.hook("pre-bash", runtime="codex", tool_input={"command": "gh pr merge 3"})
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("run it yourself", out["hookSpecificOutput"]["permissionDecisionReason"])
+        r.hook("prompt", runtime="codex", prompt="go")
+        r.write("a.py", "x = 5\n")
+        self.assertIsNone(r.hook("stop", runtime="codex"), "green: Codex gets no systemMessage")
+
+    def test_typing_land_it_trust_is_the_codex_trust_signal(self):
+        r = Repo(self, {"checks": {"t": "true"}}, trust=False)
+        self.assertIsNone(r.hook("prompt", runtime="codex", prompt="please trust land-it"))
+        self.assertFalse(json.loads(r.cli("status").stdout)["commands_trusted"], "only the exact command counts")
+        out = r.hook("prompt", runtime="codex", prompt="land-it trust")
+        self.assertEqual(out["decision"], "block", "the model never sees the trust prompt")
+        self.assertIn("check t: true", out["reason"])
+        self.assertTrue(json.loads(r.cli("status").stdout)["commands_trusted"])
+        self.assertIsNone(Repo(self, {"checks": {"t": "true"}}, trust=False).hook("prompt", prompt="land-it trust"),
+                          "in Claude Code a plain prompt isn't the trust signal; /land-it:trust is")
+
+    def test_hooks_stay_out_of_land_its_own_nested_reviewer(self):
+        r = Repo(self, {"checks": {"ok": "true"}})
+        out = r.cli("hook", "pre-bash", stdin=json.dumps({"cwd": r.root, "tool_input": {"command": "gh pr create"}}),
+                    env={"LAND_IT_HOOKS_OFF": "1"})
+        self.assertEqual((out.returncode, out.stdout), (0, ""))
 
 
 if __name__ == "__main__":

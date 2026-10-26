@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.9.0
+
+A shared core for more than one agent runtime: one config, a checked schema, a doctor, and a hook adapter with
+Codex's payloads in place.
+
+**Upgrading:** nothing breaks. `land-it config migrate` moves `.claude/land-it.json` to `.land-it/config.json` when
+you're ready; trust carries over. A config with unknown keys or wrong types now fails to load with the reason.
+
+- **`.land-it/config.json`**, the same file for any agent. The old `.claude/land-it.json` is still read; both at once
+  is an error. `land-it config` shows which one is used and validates it.
+- **Schema check on load.** Unknown keys get a "did you mean"; `stop_checks` naming a missing check, efforts outside
+  low..max, tiers that don't exist, malformed checks and breaker settings are refused, since each would quietly
+  switch a gate off. An invalid config fails closed in the policy hook.
+- **`land-it doctor`**: Python, git, gh and its login, the claude CLI, repository, config location and validity, trust,
+  base branch, shallow history, review rules (REVIEW.md referenced from CLAUDE.md, `.claude/CLAUDE.md` or AGENTS.md),
+  project-scope install. One line each, with the fix; exit 1 on a blocker.
+- **Hook adapter.** `land-it hook <event> --runtime claude|codex`. For Codex: edits come from `apply_patch` (every file
+  in the patch, moves included), `ask` becomes `deny` with "run it yourself", messages go where Codex accepts them,
+  and typing `land-it trust` as a prompt is the trust signal (Codex has no `UserPromptExpansion`). The plugin root is
+  read from `CLAUDE_PLUGIN_ROOT` or `PLUGIN_ROOT`. The Codex package itself comes in 1.0.
+- Agent instruction files (`AGENTS.md`, `.codex/**`, `.agents/**`, `.mcp.json`) are medium by default, like CLAUDE.md;
+  `.land-it/config.json` is always high.
+- Eval reviewer runs keep land-it's own hooks out (`LAND_IT_HOOKS_OFF`) and no longer copy the config into old
+  checkouts; AGENTS.md joins the review guidance they do copy.
+- The repo now dogfoods its own setup: `.land-it/config.json`, a land-it-specific `REVIEW.md`, and `.claude/CLAUDE.md`
+  importing it.
+
 ## 0.8.0
 
 CI that proves each pushed commit was reviewed (audit findings R11, R12), and a circuit breaker that observes first.

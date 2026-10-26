@@ -1,6 +1,6 @@
 ---
 name: init
-description: Set up land-it in the current repository - .claude/land-it.json (checks, on-edit formatters), REVIEW.md, the @REVIEW.md import in CLAUDE.md, a PR template with Testing/Risk/How to revert, and optionally a GitHub review workflow and branch protection. Use when the user asks to set up land-it, a pre-PR pipeline, or review rules for a project.
+description: Set up land-it in the current repository - .land-it/config.json (checks, on-edit formatters), REVIEW.md, the @REVIEW.md import in CLAUDE.md, a PR template with Testing/Risk/How to revert, and optionally a GitHub review workflow and branch protection. Use when the user asks to set up land-it, a pre-PR pipeline, or review rules for a project.
 argument-hint: "[--ci] [--sweep] [--protect]"
 allowed-tools: Bash(land-it *), Bash(git status*), Bash(git rev-parse*)
 ---
@@ -17,7 +17,9 @@ every PR carries **Testing, Risk and How to revert**. Don't overwrite an existin
 
 `git rev-parse --show-toplevel`. Not a git repo → offer `git init` and stop until the user answers.
 
-## 2. `.claude/land-it.json`
+## 2. `.land-it/config.json`
+
+If the repo has the old `.claude/land-it.json`, run `land-it config migrate` instead of writing a new file.
 
 Read the project's manifests (package.json scripts and lockfile, pyproject.toml, Cargo.toml, go.mod,
 Package.swift / *.xcodeproj, Makefile, existing CI workflows) and write the config. Shape: `templates/land-it.json`.
