@@ -8,7 +8,7 @@ allowed-tools: Bash(land-it *), Bash(git status*), Bash(git diff*), Bash(git log
 # land-it respond
 
 Talk to the user in their language. If `land-it` isn't on PATH, call
-`python3 ${CLAUDE_PLUGIN_ROOT}/bin/land-it` instead. Make sure the PR's branch is checked out
+`python3 ${CLAUDE_PLUGIN_ROOT}/bin/land-it` instead. In Codex, use the path from land-it's note at the start of the session (its SessionStart hook), since Codex doesn't put the plugin's `bin/` on PATH. Make sure the PR's branch is checked out
 (`gh pr view <PR> --json headRefName`); if it isn't, ask before switching.
 
 The article's rule: **every finding gets an answer**, fixed or resolved with a reason. A silent thread is an unanswered finding.

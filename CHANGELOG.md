@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.0.0-beta.1
+
+land-it for Codex, and a structured reviewer for both runtimes. **Beta:** the Codex package is built from Codex's
+published plugin, hook and `codex exec` documentation and tested against its documented payloads, but hasn't been
+run inside Codex yet.
+
+- **`land-it review`**: a fresh-context reviewer, `claude -p --json-schema` or `codex exec --output-schema` (read-only
+  by default), that follows REVIEW.md and returns findings as JSON checked against a schema. It adds them to the
+  ledger and records the stage itself, and only when the output is valid: a failed, timed-out or malformed review
+  records nothing. `--path` reviews existing code for sweeps. It is now preflight's fallback when a bundled review
+  skill is unavailable, and Codex's reviewer.
+- **`eval run --structured claude|codex`** scores structured findings by file and line instead of citations in prose
+  (audit E05), and is how to score a Codex reviewer.
+- **Codex package**: root `plugin.json` (portable manifest, `extensions.com.openai.hooks`), `hooks/codex-hooks.json`
+  (`--runtime codex`), `.agents/plugins/marketplace.json` for `codex plugin marketplace add FunFactoryDev/land-it`,
+  and `agents/openai.yaml` keeping `trust` and `ci-review` explicit-only. A SessionStart hook tells the model the
+  CLI's path, since Codex doesn't put `bin/` on PATH.
+- Skills say what to do in Codex: review with `land-it review --runner codex`, trust by typing `land-it trust`, and
+  `/land-it:init` points AGENTS.md at REVIEW.md.
+- CLI JSON output keeps non-ASCII text readable.
+
 ## 0.9.0
 
 A shared core for more than one agent runtime: one config, a checked schema, a doctor, and a hook adapter with

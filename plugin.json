@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "land-it",
+  "version": "1.0.0-beta.1",
+  "description": "You land it, you own it. Pre-PR review pipeline after the Claude Code team's own process: checks with evidence, risk-tiered review, a findings ledger, a stamp bound to the exact tree that passed.",
+  "extensions": {
+    "com.openai": {
+      "hooks": "./hooks/codex-hooks.json"
+    }
+  }
+}

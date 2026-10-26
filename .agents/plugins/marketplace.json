@@ -1,0 +1,20 @@
+{
+  "name": "land-it-marketplace",
+  "interface": {
+    "displayName": "land-it"
+  },
+  "plugins": [
+    {
+      "name": "land-it",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

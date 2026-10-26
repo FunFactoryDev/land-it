@@ -14,6 +14,8 @@ commands:
 
 - **Present**: show the user that list, one line per command, and say that any later change to `checks` or
   `on_edit` needs `/land-it:trust` again. Changes to other keys (risk, rounds, effort) don't.
+- **In Codex** there is no such hook. The user types `land-it trust` as a message: the hook records it and the
+  model never sees the message. If you're reading this in Codex, tell the user to do that.
 - **Absent**: say plainly that trust was **not** recorded (the plugin's hooks may be disabled, or the repo has
   no `.land-it/config.json`). Don't record it any other way: running `land-it trust` from your shell is refused
   by design. The user can run it from their own terminal.

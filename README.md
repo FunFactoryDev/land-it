@@ -105,6 +105,30 @@ flowchart TD
 
 Requirements: git, Python 3.9+ (stdlib only, nothing to install), a recent Claude Code (tested on 2.1.300).
 
+## Codex (beta)
+
+The same plugin installs in Codex: the same CLI and skills, with Codex's hooks in `hooks/codex-hooks.json` and the
+portable manifest `plugin.json` at the root.
+
+```
+codex plugin marketplace add FunFactoryDev/land-it
+```
+
+Install land-it from that marketplace, review its hooks with `/hooks` (Codex runs no plugin hook until you trust it),
+then in your repo type `land-it trust` as a message to approve the config's commands.
+
+| | Claude Code | Codex |
+|---|---|---|
+| Review | bundled `/code-review`, `/security-review` | `land-it review --runner codex`: `codex exec --output-schema`, findings as checked JSON |
+| Approving config commands | type `/land-it:trust` | type `land-it trust` (the hook takes it; the model never sees it) |
+| Merges and replies that need you | the hook asks | the hook refuses and tells you to run it yourself (Codex hooks can't ask) |
+| Review rules | CLAUDE.md imports REVIEW.md | AGENTS.md points at REVIEW.md (`/land-it:init` writes it) |
+| Finding the CLI | `bin/` is on PATH | a note at session start gives its path |
+| Policy hook when it crashes | blocks (`onFailure: block`) | Codex documents no equivalent |
+
+**Status:** built from Codex's published plugin, hook and `codex exec` documentation and tested against its
+documented payloads, but not yet run inside Codex by us. Reports are welcome.
+
 ## Daily use
 
 1. **Work as usual.** After each edit, `on_edit` formats or lints the file. When Claude ends a turn that changed
@@ -263,6 +287,7 @@ The plugin puts `land-it` on Claude's PATH; the skills call it. You can call it 
 | `land-it threads [PR \| reply ID --body B [--resolve] \| resolve ID]` | Unresolved review threads on a PR (given as N, #N or a URL; bots told apart); reply to one, resolve one |
 | `land-it sweep-target [--day N]` | Today's area for the sweep, rotating over `risk.high` |
 | `land-it ci-verdict --sha SHA [--pr N] [--dry-run]` | CI: set the `land-it/review` status of a commit from the recorded review and post open findings (deduplicated). Claude's shell can't run it |
+| `land-it review [--kind code\|security] [--range R \| --path P] [--runner claude\|codex]` | A fresh-context reviewer that returns findings as JSON checked against a schema; adds them to the ledger and records the stage, only on valid output. `--path` reviews existing code and records nothing |
 | `land-it stats [--days N] [--github]` | One-round passes, rounds, finding outcomes, reverts, the circuit breaker; GitHub human time |
 
 ## What lives where

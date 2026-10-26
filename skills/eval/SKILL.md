@@ -8,7 +8,7 @@ allowed-tools: Bash(land-it *), Bash(git log*), Bash(git show*), Bash(git blame*
 # land-it eval
 
 Talk to the user in their language. If `land-it` isn't on PATH, call
-`python3 ${CLAUDE_PLUGIN_ROOT}/bin/land-it` instead. Cases live in `.land-it/evals/*.json` and are committed:
+`python3 ${CLAUDE_PLUGIN_ROOT}/bin/land-it` instead. In Codex, use the path from land-it's note at the start of the session (its SessionStart hook), since Codex doesn't put the plugin's `bin/` on PATH. Cases live in `.land-it/evals/*.json` and are committed:
 they are the repo's memory of what the reviewer missed. Results go to `.land-it/evals/history.jsonl`.
 
 ## add: an incident becomes a case
@@ -44,6 +44,9 @@ land-it eval run [--model M] [--effort low|medium|high|xhigh|max] [--only ID ...
 
 - **recall**: share of recorded bugs the review cited within 5 lines of the recorded location.
 - **noise**: findings per known-good case.
+- `--structured claude|codex` reviews each case with `land-it review` instead of `/code-review`: the reviewer returns
+  findings as JSON checked against a schema, and each one counts once by its file and line. It's the way to score a
+  Codex reviewer, and a sturdier count than citations in prose.
 - `--judge haiku` scores with an LLM judge instead: it reads each review and decides whether the recorded defect
   is reported (worded differently or cited elsewhere still counts) and how many distinct findings there are.
   It costs one small extra call per case. Its agreement with human judgment isn't measured yet, so present the

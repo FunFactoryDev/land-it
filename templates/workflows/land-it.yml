@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  LAND_IT_REF: v0.9.0  # the land-it release this workflow runs; /land-it:init writes the installed one
+  LAND_IT_REF: v1.0.0-beta.1  # the land-it release this workflow runs; /land-it:init writes the installed one
 
 jobs:
   review:

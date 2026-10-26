@@ -1,0 +1,3 @@
+# Codex: only the user starts this skill ($trust); the model never picks it on its own.
+policy:
+  allow_implicit_invocation: false

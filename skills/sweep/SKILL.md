@@ -8,7 +8,7 @@ allowed-tools: Bash(land-it *), Bash(git log*), Bash(git blame*), Bash(gh issue 
 # land-it sweep
 
 Talk to the user in their language. If `land-it` isn't on PATH, call
-`python3 ${CLAUDE_PLUGIN_ROOT}/bin/land-it` instead.
+`python3 ${CLAUDE_PLUGIN_ROOT}/bin/land-it` instead. In Codex, use the path from land-it's note at the start of the session (its SessionStart hook), since Codex doesn't put the plugin's `bin/` on PATH.
 
 Pre-PR review only sees what changes. Bugs in code nobody touches stay until they cause an incident; a sweep
 reads one area at a time, so over a rotation every high-risk area gets read again.
@@ -22,7 +22,8 @@ top-level source directories when none are configured).
 
 Run the `code-review` skill (Skill tool) with `<effort> <target>`, where effort is `review_effort.medium` from
 `land-it risk` (default `medium`). A path target reviews the files as they are, not a diff. Keep **Important**
-findings with `file:line` evidence; drop nits and style, since a sweep is for bugs.
+findings with `file:line` evidence; drop nits and style, since a sweep is for bugs. In Codex, or when the skill
+is unavailable: `land-it review --path <target> --runner codex|claude` prints the findings as checked JSON.
 
 ## 3. Drop what's already filed
 

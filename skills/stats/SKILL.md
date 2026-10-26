@@ -8,7 +8,7 @@ allowed-tools: Bash(land-it *)
 # land-it stats
 
 Talk to the user in their language. If `land-it` isn't on PATH, call
-`python3 ${CLAUDE_PLUGIN_ROOT}/bin/land-it` instead.
+`python3 ${CLAUDE_PLUGIN_ROOT}/bin/land-it` instead. In Codex, use the path from land-it's note at the start of the session (its SessionStart hook), since Codex doesn't put the plugin's `bin/` on PATH.
 
 Run `land-it stats --days 30` (add `--github` when the user wants human-time numbers; it needs `gh` logged in).
 Then read the numbers against the article's goal: **minimum human review time with no rise in reverts or incidents.**

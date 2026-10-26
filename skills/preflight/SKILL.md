@@ -8,7 +8,7 @@ allowed-tools: Bash(land-it *), Bash(git status*), Bash(git diff*), Bash(git log
 # land-it preflight
 
 Talk to the user in their language. If `land-it` isn't on PATH, call
-`python3 ${CLAUDE_PLUGIN_ROOT}/bin/land-it` instead. No `.land-it/config.json` → offer `/land-it:init` and stop.
+`python3 ${CLAUDE_PLUGIN_ROOT}/bin/land-it` instead. In Codex, use the path from land-it's note at the start of the session (its SessionStart hook), since Codex doesn't put the plugin's `bin/` on PATH. No `.land-it/config.json` → offer `/land-it:init` and stop.
 
 The rule underneath every step: **show evidence, don't claim it.** Paste the PASS/FAIL lines, the
 finding counts, the commands. "Tests pass" without output is not a step done.
@@ -65,9 +65,14 @@ tier: low `code`; medium `code` and `security`; high `code`, `security` and `ver
 Never record `completed` for a review that errored, timed out or was cut short.
 
 If a review skill is unavailable or fails (`security-review` needs `origin/HEAD`, so it fails in a repo without a
-remote), don't substitute your own read of the code: spawn a general-purpose subagent with only the diff
-(`git diff <merge base>`) and REVIEW.md, none of your reasoning, ask it for findings with `file:line` evidence,
-record the stage as completed only when it returned, and say in the PR body which step ran this way. That
+remote), don't substitute your own read of the code: run `land-it review --kind code|security --runner claude`
+(add `--range <target>` from step 2). It starts a fresh reviewer that follows REVIEW.md and returns findings as JSON
+checked against a schema; it adds them to the ledger and records the stage itself, and only when the output was
+valid. Say in the PR body which stage ran this way.
+
+**In Codex** there are no bundled review skills: run `land-it review --kind code --runner codex` (plus `--range` from
+step 2) and, for medium and high tier, `--kind security`. Each records its findings and stage the same way. Record
+`simplify --status skipped --reason "no simplify reviewer in Codex"`, and run the behavior check yourself. That
 fallback is for **code and security review only**. A behavior check means running the thing: tests of the
 changed path, the CLI, the app. Reading the diff is not a behavior check; if nothing can run, record
 `verify --status not_run --reason "…"`.

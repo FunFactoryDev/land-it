@@ -3,6 +3,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -995,6 +996,121 @@ class CodexRuntime(unittest.TestCase):
         out = r.cli("hook", "pre-bash", stdin=json.dumps({"cwd": r.root, "tool_input": {"command": "gh pr create"}}),
                     env={"LAND_IT_HOOKS_OFF": "1"})
         self.assertEqual((out.returncode, out.stdout), (0, ""))
+
+
+
+FAKE_REVIEWERS = {
+    # both read the findings to return from FAKE_FINDINGS (JSON) and log their argv to FAKE_LOG
+    "claude": """#!/usr/bin/env python3
+import json, os, sys
+open(os.environ["FAKE_LOG"], "a").write(json.dumps(sys.argv[1:]) + "\\n")
+if os.environ.get("FAKE_FAIL"):
+    sys.exit("model overloaded")
+print(json.dumps({"is_error": False, "structured_output": json.loads(os.environ["FAKE_FINDINGS"])}))
+""",
+    "codex": """#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+open(os.environ["FAKE_LOG"], "a").write(json.dumps(args) + "\\n")
+if os.environ.get("FAKE_FAIL"):
+    sys.exit("model overloaded")
+open(args[args.index("-o") + 1], "w").write(os.environ["FAKE_FINDINGS"])
+""",
+}
+BUG = {"file": "calc.py", "line": 3, "summary": "median is wrong for even lengths", "severity": "important",
+       "evidence": "return xs[len(xs) // 2]"}
+
+
+class StructuredReview(unittest.TestCase):
+    def setUp(self):
+        self.r = r = Repo(self, {})
+        branch(r)
+        r.write("calc.py", "def median(xs):\n    xs = sorted(xs)\n    return xs[len(xs) // 2]\n")
+        r.commit("median")
+        fake = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, fake)
+        for name, body in FAKE_REVIEWERS.items():
+            with open(os.path.join(fake, name), "w") as f:
+                f.write(body)
+            os.chmod(os.path.join(fake, name), 0o755)
+        self.log = os.path.join(fake, "log")
+        self.env = {"PATH": fake + os.pathsep + os.environ["PATH"], "FAKE_LOG": self.log,
+                    "FAKE_FINDINGS": json.dumps({"findings": [BUG]})}
+
+    def review(self, *args, **env):
+        out = self.r.cli("review", *args, env=dict(self.env, **env))
+        return out.returncode, json.loads(out.stdout) if out.stdout.strip().startswith("{") else out.stderr
+
+    def stages(self):
+        return json.loads(self.r.cli("round").stdout)["stages"]
+
+    def test_findings_and_the_stage_are_recorded_from_checked_json(self):
+        self.r.cli("round")
+        for runner in ("claude", "codex"):
+            code, out = self.review("--runner", runner)
+            self.assertEqual((code, out["stage"]), (0, "completed"), runner)
+        self.assertEqual(self.stages()["code"]["runner"], "codex")
+        findings = json.loads(self.r.cli("findings").stdout)["findings"]
+        self.assertEqual([(f["file"], f["line"], f["introduced"]) for f in findings], [("calc.py", 3, "this-change")],
+                         "the second runner's identical finding isn't recorded twice")
+        with open(self.log) as f:
+            calls = [json.loads(ln) for ln in f]
+        self.assertIn("--json-schema", calls[0])
+        self.assertEqual(calls[1][:2], ["exec", "--output-schema"])
+        self.assertIn("git diff", calls[1][-1], "the prompt names the diff to review")
+
+    def test_a_failed_or_malformed_review_records_nothing(self):
+        self.r.cli("round")
+        for env in ({"FAKE_FAIL": "1"}, {"FAKE_FINDINGS": '{"findings": [{"file": "calc.py", "line": 0}]}'},
+                    {"FAKE_FINDINGS": "not json"}):
+            code, out = self.review("--runner", "codex", **env)
+            self.assertEqual((code, out["stage"]), (2, "not recorded"), env)
+        self.assertEqual(self.stages(), {})
+        self.assertEqual(json.loads(self.r.cli("findings").stdout)["findings"], [])
+
+    def test_needs_a_round_but_path_mode_doesnt(self):
+        code, err = self.review()
+        self.assertIn("run `land-it round` first", err)
+        code, out = self.review("--path", "calc.py", "--runner", "codex")
+        self.assertEqual((code, out["findings"]), (0, [BUG]))
+
+    def test_eval_scores_structured_findings(self):
+        bug = sh(self.r.root, "git", "rev-parse", "HEAD").strip()
+        self.r.cli("eval", "add", "--commit", bug, "--file", "calc.py", "--line", "3", "--summary", "even lengths")
+        out = self.r.cli("eval", "run", "--structured", "codex", env=self.env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("caught 1/1, 1 finding(s)", out.stdout)
+        with open(os.path.join(self.r.root, LI.EVAL_DIR, "history.jsonl")) as f:
+            self.assertTrue(json.loads(f.readline())["scorer"].startswith("structured:codex:"))
+
+
+class CodexPackage(unittest.TestCase):
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(BIN)))
+
+    def load(self, rel):
+        with open(os.path.join(self.ROOT, rel)) as f:
+            return json.load(f)
+
+    def test_manifests_agree_and_hooks_point_at_real_events(self):
+        codex, claude = self.load("plugin.json"), self.load(".claude-plugin/plugin.json")
+        self.assertEqual((codex["name"], codex["version"]), (claude["name"], claude["version"]))
+        hooks_file = codex["extensions"]["com.openai"]["hooks"]
+        self.assertTrue(hooks_file.startswith("./"))
+        for event, groups in self.load(hooks_file)["hooks"].items():
+            for g in groups:
+                for h in g["hooks"]:
+                    name = re.search(r"hook (\S+) --runtime codex", h["command"]).group(1)
+                    self.assertEqual(LI.EVENTS[name], event)
+                    self.assertIn("${PLUGIN_ROOT}/bin/land-it", h["command"])
+        entry = self.load(".agents/plugins/marketplace.json")["plugins"][0]
+        self.assertEqual((entry["name"], entry["source"]["path"]), ("land-it", "./"))
+
+    def test_session_start_tells_codex_where_the_cli_is(self):
+        r = Repo(self, None)
+        out = r.cli("hook", "session", "--runtime", "codex", stdin=json.dumps({"cwd": r.root}),
+                    env={"PLUGIN_ROOT": "/opt/land-it", "CLAUDE_PLUGIN_ROOT": ""})
+        ctx = json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("python3 /opt/land-it/bin/land-it", ctx, "even before /land-it:init")
 
 
 if __name__ == "__main__":

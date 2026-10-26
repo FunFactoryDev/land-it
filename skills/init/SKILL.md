@@ -8,7 +8,7 @@ allowed-tools: Bash(land-it *), Bash(git status*), Bash(git rev-parse*)
 # land-it init
 
 Talk to the user in their language. Templates live in `${CLAUDE_PLUGIN_ROOT}/templates/`.
-If `land-it` isn't on PATH, call `python3 ${CLAUDE_PLUGIN_ROOT}/bin/land-it` instead.
+If `land-it` isn't on PATH, call `python3 ${CLAUDE_PLUGIN_ROOT}/bin/land-it` instead. In Codex, use the path from land-it's note at the start of the session (its SessionStart hook), since Codex doesn't put the plugin's `bin/` on PATH.
 
 The goal is a repo where the agent has **runnable checks**, the reviewer has **repo-specific rules**, and
 every PR carries **Testing, Risk and How to revert**. Don't overwrite an existing file without showing a diff and asking.
@@ -68,6 +68,10 @@ that you can see in the code or docs. Delete example lines that don't apply. Und
 `/code-review` follows CLAUDE.md but doesn't read REVIEW.md, so CLAUDE.md must import it. Add the line
 `@REVIEW.md` (once). If there is no CLAUDE.md, write a short one: stack, how to run each check (same
 commands as the config), conventions, non-goals, links to deeper docs. Short beats complete.
+
+In a repo worked on with **Codex** too: Codex reads AGENTS.md, not CLAUDE.md imports. Add a short "Review rules"
+section to AGENTS.md (create it if missing) that points at REVIEW.md, and tell the user to review land-it's hooks
+with `/hooks` and to trust its commands by typing `land-it trust` as a message.
 
 ## 5. PR template
 
